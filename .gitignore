@@ -1,0 +1,23 @@
+# Python virtualenv
+.venv/
+venv/
+ENV/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Datasets & generated artifacts
+data/
+artifacts/
+
+# Training logs & results (your runs...)
+runs*/
+wandb/
