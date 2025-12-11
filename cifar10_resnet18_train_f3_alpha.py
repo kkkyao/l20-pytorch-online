@@ -52,6 +52,12 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from data_cifar10 import load_cifar10  # your existing CIFAR-10 loader
 
+# Optional wandb
+try:
+    import wandb  # type: ignore
+except ImportError:
+    wandb = None
+
 
 # ------------------------------- Utilities -------------------------------
 
@@ -368,16 +374,53 @@ def main():
     ap.add_argument("--eta_max", type=float, default=1.0)
     ap.add_argument("--theta_lr", type=float, default=1e-3)
     ap.add_argument("--clip_grad", type=float, default=1.0)
-    ap.add_argument("--beta", type=float, default=0.9,
-                    help="EMA coefficient for gradient moving average m_t")
-    ap.add_argument("--alpha", type=float, default=0.5,
-                    help="mixing coefficient between gradient and momentum")
+    ap.add_argument(
+        "--beta",
+        type=float,
+        default=0.9,
+        help="EMA coefficient for gradient moving average m_t",
+    )
+    ap.add_argument(
+        "--alpha",
+        type=float,
+        default=0.5,
+        help="mixing coefficient between gradient and momentum",
+    )
+
+    # WandB logging
+    ap.add_argument(
+        "--wandb",
+        action="store_true",
+        help="enable Weights & Biases logging",
+    )
+    ap.add_argument(
+        "--wandb_project",
+        type=str,
+        default="l2o-cifar10",
+        help="WandB project name",
+    )
+    ap.add_argument(
+        "--wandb_group",
+        type=str,
+        default="cifar10_resnet18_f3alpha_bf3pt",
+        help="WandB group name",
+    )
+    ap.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="optional WandB run name, defaults to run_name",
+    )
 
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
     set_seed(args.seed)
+
+    # Clamp alpha into [0, 1] for safety.
+    alpha = float(np.clip(args.alpha, 0.0, 1.0))
+    print(f"[INFO] Using alpha_mix = {alpha:.3f}")
 
     # Run directory: encode CIFAR-10 + ResNet18 + F3+alpha
     run_name = (
@@ -386,6 +429,43 @@ def main():
     )
     run_dir = Path("runs") / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] run_dir = {run_dir}")
+
+    # ---------------- WandB init (optional) ----------------
+    wandb_run = None
+    if args.wandb:
+        if wandb is None:
+            raise RuntimeError(
+                "wandb is not installed, but --wandb was passed. "
+                "Install via `pip install wandb` or disable --wandb."
+            )
+        wandb_config = {
+            "stage": "online-train",
+            "dataset": "CIFAR-10",
+            "backbone": "ResNet18",
+            "method": "learned_l_f3alpha_cifar10_resnet18_online_pt",
+            "seed": args.seed,
+            "data_seed": args.data_seed,
+            "epochs": args.epochs,
+            "batch_size": args.bs,
+            "c_base": args.c_base,
+            "eps": args.eps,
+            "Lmin": args.Lmin,
+            "Lmax": args.Lmax,
+            "warmup_steps": args.warmup_steps,
+            "eta_min": args.eta_min,
+            "eta_max": args.eta_max,
+            "theta_lr": args.theta_lr,
+            "clip_grad": args.clip_grad,
+            "beta": args.beta,
+            "alpha": alpha,
+        }
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            group=args.wandb_group,
+            name=args.wandb_run_name or run_name,
+            config=wandb_config,
+        )
 
     # ---------------- data ----------------
     # CIFAR-10 loader does not take a `seed` argument.
@@ -520,8 +600,6 @@ def main():
                     m_buffers[i] = args.beta * m + (1.0 - args.beta) * g
 
             # --- 3) Compute F3+alpha features ---
-            alpha = args.alpha
-
             # mix versions for features
             g_mix_list = [(1.0 - alpha) * g.detach() for g in grads]
             m_mix_list = [alpha * m for m in m_buffers]
@@ -688,12 +766,27 @@ def main():
             f.write(f"{epoch},{epoch_elapsed:.3f},{total_elapsed:.3f}\n")
 
         print(
-            f"[CIFAR10-ResNet18-F3+alpha-PT EPOCH {epoch}] "
+            f"[CIFAR10-ResNet18-F3Alpha-PT EPOCH {epoch}] "
             f"time={epoch_elapsed:.2f}s total={total_elapsed/60:.2f}min "
             f"train={train_loss_epoch:.4f} "
             f"val={val_loss_epoch:.4f} test={test_loss_epoch:.4f} "
             f"val_acc={val_acc:.4f} test_acc={test_acc:.4f}"
         )
+
+        # WandB per-epoch logging
+        if wandb_run is not None:
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss_epoch,
+                    "val_loss": val_loss_epoch,
+                    "test_loss": test_loss_epoch,
+                    "val_acc": val_acc,
+                    "test_acc": test_acc,
+                    "time/epoch_sec": epoch_elapsed,
+                    "time/total_sec": total_elapsed,
+                }
+            )
 
     curve_logger.on_train_end()
     total_time = time.time() - start_time
@@ -707,7 +800,7 @@ def main():
         final_test_acc = (preds_test == y_test_t.to(device)).float().mean().item()
 
     print(
-        f"[RESULT-CIFAR10-ResNet18-F3+alpha-PT] TestAcc={final_test_acc:.4f} "
+        f"[RESULT-CIFAR10-ResNet18-F3Alpha-PT] TestAcc={final_test_acc:.4f} "
         f"TestLoss={final_test_loss:.4f} "
         f"(Total time={total_time/60:.2f} min)"
     )
@@ -736,11 +829,30 @@ def main():
             "theta_lr": args.theta_lr,
             "clip_grad": args.clip_grad,
             "beta": args.beta,
-            "alpha": args.alpha,
+            "alpha": alpha,
         },
     }
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
+
+    # WandB summary + upload logs
+    if wandb_run is not None:
+        wandb_run.summary["final_test_acc"] = float(final_test_acc)
+        wandb_run.summary["final_test_loss"] = float(final_test_loss)
+        wandb_run.summary["total_time_sec"] = float(total_time)
+        wandb_run.summary["alpha"] = float(alpha)
+
+        for p in [
+            curve_logger.curve_path,
+            mech_path,
+            train_log_path,
+            time_log_path,
+            result_path,
+        ]:
+            if Path(p).exists():
+                wandb.save(str(p))
+
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

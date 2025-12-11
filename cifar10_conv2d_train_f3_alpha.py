@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 # -*- coding: utf-8 -*-
 """
 PyTorch BF-style (B+F3 α-mix) online meta-learning on CIFAR-10 with a Conv2D backbone.
@@ -48,6 +48,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from data_cifar10 import load_cifar10  # as defined in data_cifar10.py
+
+# Optional wandb
+try:
+    import wandb  # type: ignore
+except ImportError:
+    wandb = None
 
 
 # ------------------------------- Utilities -------------------------------
@@ -312,6 +318,31 @@ def main():
     ap.add_argument("--alpha_mix", type=float, default=1.0,
                     help="mixing coefficient alpha in [0,1] for F3 α-mix")
 
+    # WandB logging (same style as F3)
+    ap.add_argument(
+        "--wandb",
+        action="store_true",
+        help="enable Weights & Biases logging",
+    )
+    ap.add_argument(
+        "--wandb_project",
+        type=str,
+        default="l2o-cifar10",
+        help="WandB project name",
+    )
+    ap.add_argument(
+        "--wandb_group",
+        type=str,
+        default="cifar10_conv2d_f3alpha_bf1pt",
+        help="WandB group name",
+    )
+    ap.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="optional WandB run name, defaults to run_name",
+    )
+
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -329,6 +360,43 @@ def main():
     )
     run_dir = Path("runs") / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] run_dir = {run_dir}")
+
+    # ---------------- WandB init (optional) ----------------
+    wandb_run = None
+    if args.wandb:
+        if wandb is None:
+            raise RuntimeError(
+                "wandb is not installed, but --wandb was passed. "
+                "Install via `pip install wandb` or disable --wandb."
+            )
+        wandb_config = {
+            "stage": "online-train",
+            "dataset": "CIFAR-10",
+            "backbone": "Conv2D",
+            "method": "learned_l_f3_alphamix_cifar10_conv2d_online_pt",
+            "seed": args.seed,
+            "data_seed": args.data_seed,
+            "epochs": args.epochs,
+            "batch_size": args.bs,
+            "c_base": args.c_base,
+            "eps": args.eps,
+            "Lmin": args.Lmin,
+            "Lmax": args.Lmax,
+            "warmup_steps": args.warmup_steps,
+            "eta_min": args.eta_min,
+            "eta_max": args.eta_max,
+            "theta_lr": args.theta_lr,
+            "clip_grad": args.clip_grad,
+            "beta": args.beta,
+            "alpha_mix": alpha,
+        }
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            group=args.wandb_group,
+            name=args.wandb_run_name or run_name,
+            config=wandb_config,
+        )
 
     # ---------------- data ----------------
     # CIFAR-10 loader does not take a `seed` argument.
@@ -423,7 +491,7 @@ def main():
     with open(time_log_path, "w") as f:
         f.write("epoch,epoch_time_sec,total_elapsed_sec\n")
 
-    global_step = 0
+    global_step = 0    # for warmup and logging
     start_time = time.time()
 
     # ---------------- training loop (online meta-learning, F3 α-mix) ----------------
@@ -638,6 +706,22 @@ def main():
             f"val_acc={val_acc:.4f} test_acc={test_acc:.4f}"
         )
 
+        # WandB per-epoch logging
+        if wandb_run is not None:
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss_epoch,
+                    "val_loss": val_loss_epoch,
+                    "test_loss": test_loss_epoch,
+                    "val_acc": val_acc,
+                    "test_acc": test_acc,
+                    "time/epoch_sec": epoch_elapsed,
+                    "time/total_sec": total_elapsed,
+                    "alpha_mix": alpha,
+                }
+            )
+
     curve_logger.on_train_end()
     total_time = time.time() - start_time
 
@@ -685,6 +769,24 @@ def main():
     }
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
+
+    # WandB summary + upload files
+    if wandb_run is not None:
+        wandb_run.summary["final_test_acc"] = float(final_test_acc)
+        wandb_run.summary["final_test_loss"] = float(final_test_loss)
+        wandb_run.summary["total_time_sec"] = float(total_time)
+
+        for p in [
+            curve_logger.curve_path,
+            mech_path,
+            train_log_path,
+            time_log_path,
+            result_path,
+        ]:
+            if Path(p).exists():
+                wandb.save(str(p))
+
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ Key design:
   - No separate meta-train/meta-test split inside this script:
       net and LearnedL are trained jointly online on the same task.
   - Data preprocessing, normalization, and log file naming are aligned
-    with the F1 PyTorch implementation.
+    with the F1/F2 PyTorch implementations.
 """
 
 import argparse
@@ -45,6 +45,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from data_mnist1d import load_mnist1d
+
+# Optional wandb
+try:
+    import wandb  # type: ignore
+except ImportError:
+    wandb = None
 
 
 # ------------------------------- Utilities -------------------------------
@@ -245,7 +251,7 @@ def main():
     ap.add_argument("--bs", type=int, default=128)
     ap.add_argument("--preprocess_dir", type=str, default="artifacts/preprocess")
 
-    # Learner hyperparameters (aligned with the F1 implementation)
+    # Learner hyperparameters (aligned with the F1/F2 implementations)
     ap.add_argument("--c_base", type=float, default=1.0)
     ap.add_argument("--eps", type=float, default=1e-8)
     ap.add_argument("--Lmin", type=float, default=1e-3)
@@ -259,19 +265,81 @@ def main():
     # Momentum hyperparameter
     ap.add_argument("--beta", type=float, default=0.9, help="momentum coefficient")
 
+    # WandB logging
+    ap.add_argument(
+        "--wandb",
+        action="store_true",
+        help="enable Weights & Biases logging",
+    )
+    ap.add_argument(
+        "--wandb_project",
+        type=str,
+        default="l2o-mnist1d",
+        help="WandB project name",
+    )
+    ap.add_argument(
+        "--wandb_group",
+        type=str,
+        default="mnist1d_conv1d_f3_bf_online",
+        help="WandB group name",
+    )
+    ap.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="optional WandB run name, defaults to run_name",
+    )
+
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
     set_seed(args.seed)
 
-    # Run directory: keep naming aligned with TF-style naming
+    # Run directory: keep naming aligned with Conv1D BF F* scripts
     run_name = (
-        f"f3_conv1d_data{args.data_seed}_seed{args.seed}_"
+        f"mnist1d_conv1d_f3_data{args.data_seed}_seed{args.seed}_"
         + datetime.now().strftime("%Y%m%d-%H%M%S")
     )
     run_dir = Path("runs") / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] run_dir = {run_dir}")
+
+    # ---------------- WandB init (optional) ----------------
+    wandb_run = None
+    if args.wandb:
+        if wandb is None:
+            raise RuntimeError(
+                "wandb is not installed, but --wandb was passed. "
+                "Install via `pip install wandb` or disable --wandb."
+            )
+        wandb_config = {
+            "stage": "online-train",
+            "dataset": "MNIST-1D",
+            "backbone": "Conv1D",
+            "method": "learned_l_f3_mnist1d_conv1d_online_pt",
+            "length": args.length,
+            "seed": args.seed,
+            "data_seed": args.data_seed,
+            "epochs": args.epochs,
+            "batch_size": args.bs,
+            "c_base": args.c_base,
+            "eps": args.eps,
+            "Lmin": args.Lmin,
+            "Lmax": args.Lmax,
+            "warmup_steps": args.warmup_steps,
+            "eta_min": args.eta_min,
+            "eta_max": args.eta_max,
+            "theta_lr": args.theta_lr,
+            "clip_grad": args.clip_grad,
+            "beta": args.beta,
+        }
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            group=args.wandb_group,
+            name=args.wandb_run_name or run_name,
+            config=wandb_config,
+        )
 
     # ---------------- data ----------------
     (xtr, ytr), (xte, yte) = load_mnist1d(length=args.length, seed=args.data_seed)
@@ -337,13 +405,19 @@ def main():
     theta_opt = torch.optim.Adam(learner.parameters(), lr=args.theta_lr)
     ce = nn.CrossEntropyLoss()
 
-    # Momentum buffers for each parameter (same shape, on the same device)
-    momentum = [torch.zeros_like(p, device=device) for p in net.parameters()]
+    params = list(net.parameters())
+    # Momentum buffers for each parameter (same shape)
+    momentum = [torch.zeros_like(p) for p in params]
 
     # ---------------- logs ----------------
     curve_logger = BatchLossLogger(
         run_dir,
-        meta={"method": "learned_l_f3", "seed": args.seed, "opt": "learnedL", "lr": args.theta_lr},
+        meta={
+            "method": "learned_l_f3_mnist1d_conv1d",
+            "seed": args.seed,
+            "opt": "learnedL",
+            "lr": args.theta_lr,
+        },
     )
     mech_path = run_dir / "mechanism_f3.csv"
     train_log_path = run_dir / "train_log_f3.csv"
@@ -382,13 +456,13 @@ def main():
 
             grads = torch.autograd.grad(
                 train_loss,
-                list(net.parameters()),
+                params,
                 create_graph=False,
                 retain_graph=False,
             )
             grads = [
                 g if g is not None else torch.zeros_like(p)
-                for g, p in zip(grads, net.parameters())
+                for g, p in zip(grads, params)
             ]
 
             # --- 2) Update momentum m_t = beta * m_{t-1} + (1 - beta) * g_t ---
@@ -424,13 +498,13 @@ def main():
             val_loss = ce(logits_val, yv)
             grad_val = torch.autograd.grad(
                 val_loss,
-                list(net.parameters()),
+                params,
                 create_graph=False,
                 retain_graph=False,
             )
             grad_val = [
                 gv if gv is not None else torch.zeros_like(p)
-                for gv, p in zip(grad_val, net.parameters())
+                for gv, p in zip(grad_val, params)
             ]
 
             # dot = sum <grad_val, stop_grad(m_t)>
@@ -443,7 +517,7 @@ def main():
             L_theta = learner(phi_in)  # [1, 1]
             eta = args.c_base / (L_theta + args.eps)
 
-            # Warmup logic aligned with the F1 implementation
+            # Warmup logic aligned with the F1/F2 implementations
             if global_step < args.warmup_steps:
                 warmup_max = min(
                     args.eta_max,
@@ -491,7 +565,7 @@ def main():
                     eta_now = torch.clamp(eta_now, min=args.eta_min, max=args.eta_max)
                 eta_scalar_now = eta_now.squeeze()
 
-                for p, m in zip(net.parameters(), momentum):
+                for p, m in zip(params, momentum):
                     m_update = m * clip_coef
                     p.data -= eta_scalar_now.to(p.device).to(p.dtype) * m_update
 
@@ -551,12 +625,27 @@ def main():
             f.write(f"{epoch},{epoch_elapsed:.3f},{total_elapsed:.3f}\n")
 
         print(
-            f"[F3-PT EPOCH {epoch}] "
+            f"[MNIST1D-Conv1D-F3-PT EPOCH {epoch}] "
             f"time={epoch_elapsed:.2f}s total={total_elapsed/60:.2f}min "
             f"train={train_loss_epoch:.4f} "
             f"val={val_loss_epoch:.4f} test={test_loss_epoch:.4f} "
             f"val_acc={val_acc:.4f} test_acc={test_acc:.4f}"
         )
+
+        # WandB per-epoch logging
+        if wandb_run is not None:
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss_epoch,
+                    "val_loss": val_loss_epoch,
+                    "test_loss": test_loss_epoch,
+                    "val_acc": val_acc,
+                    "test_acc": test_acc,
+                    "time/epoch_sec": epoch_elapsed,
+                    "time/total_sec": total_elapsed,
+                }
+            )
 
     curve_logger.on_train_end()
     total_time = time.time() - start_time
@@ -570,14 +659,15 @@ def main():
         final_test_acc = (preds_test == y_test_t.to(device)).float().mean().item()
 
     print(
-        f"[RESULT-F3-PT] TestAcc={final_test_acc:.4f} "
+        f"[RESULT-MNIST1D-Conv1D-F3-PT] TestAcc={final_test_acc:.4f} "
         f"TestLoss={final_test_loss:.4f} "
         f"(Total time={total_time/60:.2f} min)"
     )
 
     result = {
         "dataset": f"MNIST-1D(len={args.length})",
-        "method": "learned_l_f3_online_pt",
+        "backbone": "Conv1D",
+        "method": "learned_l_f3_mnist1d_conv1d_online_pt",
         "epochs": int(args.epochs),
         "bs": int(args.bs),
         "seed": int(args.seed),
@@ -602,6 +692,24 @@ def main():
     }
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
+
+    # WandB summary + upload logs
+    if wandb_run is not None:
+        wandb_run.summary["final_test_acc"] = float(final_test_acc)
+        wandb_run.summary["final_test_loss"] = float(final_test_loss)
+        wandb_run.summary["total_time_sec"] = float(total_time)
+
+        for p in [
+            curve_logger.curve_path,
+            mech_path,
+            train_log_path,
+            time_log_path,
+            result_path,
+        ]:
+            if Path(p).exists():
+                wandb.save(str(p))
+
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
