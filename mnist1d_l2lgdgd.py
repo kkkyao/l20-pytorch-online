@@ -41,6 +41,10 @@ def detach_var(v):
     return w(out)
 
 
+def get_device():
+    return torch.device("cuda" if USE_CUDA else "cpu")
+
+
 # ---------------------- MNIST-1D task ----------------------
 class MNIST1DLoss:
     """
@@ -83,18 +87,24 @@ class MNIST1DOptimizee(nn.Module):
 
     This matches the MNIST experiment in L2L-GDGD,
     except that we use MNIST-1D instead of 28x28 images.
+
+    IMPORTANT:
+      - Parameters are stored in a plain dict; they are NOT automatically moved by .cuda().
+      - Therefore, when params is None, we MUST create them directly on the correct device.
     """
 
     def __init__(self, hidden_dim=20, params=None):
         super().__init__()
         if params is None:
+            device = get_device()
             self.params = {
-                "W1": nn.Parameter(torch.randn(40, hidden_dim) * 0.01),
-                "b1": nn.Parameter(torch.zeros(hidden_dim)),
-                "W2": nn.Parameter(torch.randn(hidden_dim, 10) * 0.01),
-                "b2": nn.Parameter(torch.zeros(10)),
+                "W1": nn.Parameter(torch.randn(40, hidden_dim, device=device) * 0.01),
+                "b1": nn.Parameter(torch.zeros(hidden_dim, device=device)),
+                "W2": nn.Parameter(torch.randn(hidden_dim, 10, device=device) * 0.01),
+                "b2": nn.Parameter(torch.zeros(10, device=device)),
             }
         else:
+            # Assume caller provides tensors/parameters already on correct device
             self.params = params
 
     def all_named_parameters(self):
@@ -105,6 +115,7 @@ class MNIST1DOptimizee(nn.Module):
         x = w(x)
         y = w(y)
 
+        # All params must be on same device as x
         h = torch.sigmoid(x @ self.params["W1"] + self.params["b1"])
         logits = h @ self.params["W2"] + self.params["b2"]
 
@@ -173,7 +184,7 @@ def do_fit(
         unroll = 1
 
     loss_obj = MNIST1DLoss(training=training)
-    optimizee = w(MNIST1DOptimizee())
+    optimizee = w(MNIST1DOptimizee())  # safe now: params were created on correct device
 
     # count total parameters
     n_params = sum(
@@ -183,7 +194,7 @@ def do_fit(
     hidden = [w(torch.zeros(n_params, opt_net.hidden_sz)) for _ in range(2)]
     cell = [w(torch.zeros(n_params, opt_net.hidden_sz)) for _ in range(2)]
 
-    if training:
+    if training and meta_opt is not None:
         meta_opt.zero_grad()
 
     total_loss = None
@@ -222,7 +233,7 @@ def do_fit(
             offset += sz
 
         if step % unroll == 0:
-            if training:
+            if training and meta_opt is not None:
                 meta_opt.zero_grad()
                 total_loss.backward()
                 meta_opt.step()
