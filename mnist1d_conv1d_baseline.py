@@ -198,8 +198,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device, batch_logger=No
     model.train()
     loss_sum, correct, total = 0.0, 0, 0
     for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
+        # Fix dtype mismatch: Conv1d expects float32 inputs, labels int64
+        x = x.to(device=device, dtype=torch.float32)
+        y = y.to(device=device, dtype=torch.long)
+
+        optimizer.zero_grad(set_to_none=True)
         logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
@@ -212,7 +215,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, batch_logger=No
         correct += (logits.argmax(1) == y).sum().item()
         total += y.size(0)
 
-    return loss_sum / total, correct / total
+    return loss_sum / max(total, 1), correct / max(total, 1)
 
 
 def evaluate(model, loader, criterion, device):
@@ -220,13 +223,16 @@ def evaluate(model, loader, criterion, device):
     loss_sum, correct, total = 0.0, 0, 0
     with torch.no_grad():
         for x, y in loader:
-            x, y = x.to(device), y.to(device)
+            # Fix dtype mismatch: Conv1d expects float32 inputs, labels int64
+            x = x.to(device=device, dtype=torch.float32)
+            y = y.to(device=device, dtype=torch.long)
+
             logits = model(x)
             loss = criterion(logits, y)
             loss_sum += loss.item() * y.size(0)
             correct += (logits.argmax(1) == y).sum().item()
             total += y.size(0)
-    return loss_sum / total, correct / total
+    return loss_sum / max(total, 1), correct / max(total, 1)
 
 
 # ---------------------- Main ----------------------
@@ -255,26 +261,48 @@ def main():
     xtr = to_N40(xtr).astype(np.float32)
     xte = to_N40(xte).astype(np.float32)
 
+    # Ensure labels are int64
+    ytr = np.asarray(ytr, dtype=np.int64)
+    yte = np.asarray(yte, dtype=np.int64)
+
     split, norm = load_artifacts(Path(args.preprocess_dir), args.data_seed)
-    mean, std = np.array(norm["mean"]), np.array(norm["std"])
+    mean = np.asarray(norm["mean"], dtype=np.float32)
+    std = np.asarray(norm["std"], dtype=np.float32)
 
-    x_train = apply_norm_np(xtr[split["train_idx"]], mean, std)[..., None]
-    x_val = apply_norm_np(xtr[split["val_idx"]], mean, std)[..., None]
-    x_test = apply_norm_np(xte, mean, std)[..., None]
+    x_train = apply_norm_np(xtr[split["train_idx"]], mean, std)[..., None].astype(np.float32)
+    x_val = apply_norm_np(xtr[split["val_idx"]], mean, std)[..., None].astype(np.float32)
+    x_test = apply_norm_np(xte, mean, std)[..., None].astype(np.float32)
 
-    def to_tensor(x): return torch.from_numpy(x).permute(0, 2, 1)
+    def to_tensor_n1l(x: np.ndarray) -> torch.Tensor:
+        # x: [N, 40, 1] -> [N, 1, 40]
+        return torch.from_numpy(x).permute(0, 2, 1).contiguous().to(dtype=torch.float32)
+
+    # Build datasets with explicit dtypes (float32 inputs, int64 labels)
+    train_x_t = to_tensor_n1l(x_train)
+    val_x_t = to_tensor_n1l(x_val)
+    test_x_t = to_tensor_n1l(x_test)
+
+    train_y_t = torch.from_numpy(ytr[split["train_idx"]]).to(dtype=torch.long)
+    val_y_t = torch.from_numpy(ytr[split["val_idx"]]).to(dtype=torch.long)
+    test_y_t = torch.from_numpy(yte).to(dtype=torch.long)
 
     train_loader = DataLoader(
-        TensorDataset(to_tensor(x_train), torch.from_numpy(ytr[split["train_idx"]])),
-        batch_size=args.bs, shuffle=True
+        TensorDataset(train_x_t, train_y_t),
+        batch_size=args.bs,
+        shuffle=True,
+        drop_last=False,
     )
     val_loader = DataLoader(
-        TensorDataset(to_tensor(x_val), torch.from_numpy(ytr[split["val_idx"]])),
-        batch_size=args.bs
+        TensorDataset(val_x_t, val_y_t),
+        batch_size=args.bs,
+        shuffle=False,
+        drop_last=False,
     )
     test_loader = DataLoader(
-        TensorDataset(to_tensor(x_test), torch.from_numpy(yte)),
-        batch_size=args.bs
+        TensorDataset(test_x_t, test_y_t),
+        batch_size=args.bs,
+        shuffle=False,
+        drop_last=False,
     )
 
     model = Conv1DMNIST1D().to(device)
@@ -345,15 +373,15 @@ def main():
 
     with open(run_dir / "result.json", "w") as f:
         json.dump({
-            "test_loss": final_test_loss,
-            "test_acc": final_test_acc,
+            "test_loss": float(final_test_loss),
+            "test_acc": float(final_test_acc),
         }, f, indent=2)
 
     if wandb_run:
         import wandb
         wandb.log({
-            "final_test_loss": final_test_loss,
-            "final_test_acc": final_test_acc,
+            "final_test_loss": float(final_test_loss),
+            "final_test_acc": float(final_test_acc),
         })
         wandb.finish()
 
