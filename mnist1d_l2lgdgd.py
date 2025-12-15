@@ -3,18 +3,21 @@
 
 """
 MNIST-1D: Learning to Learn by Gradient Descent by Gradient Descent (L2L-GDGD)
-(Task-distribution version, paper-style)
+(Task-distribution version, paper/notebook-style)
 
-Key changes vs your previous "task_seed changes dataset":
-  - Fix ONE dataset by data_seed (load_mnist1d(seed=data_seed)).
-  - Each "task" is a different minibatch stream (different shuffle order) controlled by task_seed.
-  - Add tanh bounding on optimizer output for stability: update = tanh(out) and then scaled by out_mul.
+This version aligns closer to the reproduction notebook you pasted:
 
-Adds:
+Key changes vs your current file:
+  - REMOVE tanh bounding on optimizer output (notebook doesn't have tanh)
+  - Optimizee init scale default 1e-3 (notebook uses 1e-3 for MNIST matrices)
+  - Add MNIST1D per-position normalization via --preprocess_dir/norm.json (high impact)
+  - Keep "task = minibatch stream" distribution: fixed dataset by data_seed, task differs by shuffle order (task_seed)
+
+Adds/keeps:
   - argparse
-  - wandb (optional)
+  - wandb optional
   - run_dir outputs
-  - per-meta-epoch evaluation of optimizee train/test loss+acc
+  - per-meta-epoch evaluation of optimizee train/test loss+acc (like F1/F2/F3)
 """
 
 import argparse
@@ -32,7 +35,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.autograd import Variable
 from torch.utils.data import DataLoader, TensorDataset
 
 from data_mnist1d import load_mnist1d
@@ -57,12 +59,51 @@ def set_seed(seed: int):
 
 def detach_var(v: torch.Tensor) -> torch.Tensor:
     """
-    Detach variable from previous graph but keep requires_grad.
-    CRITICAL for truncated BPTT in L2L-GDGD.
+    Detach from previous graph and create a fresh leaf tensor with requires_grad=True.
+    This is CRITICAL for truncated BPTT in L2L-GDGD.
     """
-    out = Variable(v.detach().data, requires_grad=True)
+    device = get_device()
+    out = v.detach().clone().to(device)
+    out.requires_grad_(True)
     out.retain_grad()
-    return out.to(get_device())
+    return out
+
+
+# ---------------------- MNIST1D normalization helpers ----------------------
+def _to_N40(x: np.ndarray, length: int = 40) -> np.ndarray:
+    x = np.asarray(x)
+    if x.ndim == 2 and x.shape[1] == length:
+        return x
+    if x.ndim == 3:
+        # [N, 40, 1] or [N, 1, 40]
+        if x.shape[1] == length and x.shape[2] == 1:
+            return x[:, :, 0]
+        if x.shape[1] == 1 and x.shape[2] == length:
+            return x[:, 0, :]
+    raise AssertionError(f"Unexpected x shape: {x.shape}")
+
+
+def load_norm_stats(preprocess_dir: Path, data_seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Expect: {preprocess_dir}/seed_{data_seed}/norm.json
+      {"mean": [...len40...], "std": [...len40...]}
+    """
+    pdir = preprocess_dir / f"seed_{data_seed}"
+    norm_path = pdir / "norm.json"
+    if not norm_path.exists():
+        raise FileNotFoundError(f"norm.json not found: {norm_path}")
+    with open(norm_path, "r") as f:
+        norm = json.load(f)
+    mean = np.asarray(norm["mean"], dtype=np.float32)
+    std = np.asarray(norm["std"], dtype=np.float32)
+    return mean, std
+
+
+def apply_norm(x: np.ndarray, mean: np.ndarray, std: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    mean = np.asarray(mean, dtype=np.float32)
+    std = np.asarray(std, dtype=np.float32)
+    return (x - mean[None, :]) / (std[None, :] + eps)
 
 
 # ---------------------- Task: minibatch stream (paper-style) ----------------------
@@ -109,23 +150,35 @@ class MNIST1DOptimizee(nn.Module):
     Functional MLP optimizee:
         input(40) -> hidden(20, sigmoid) -> output(10)
 
-    IMPORTANT:
+    NOTE:
       - Parameters stored in a plain dict are NOT auto-moved by .to(device).
       - So when params is None, we MUST create them on the correct device.
+      - init_scale default is 1e-3 to match the notebook MNIST net style (important for sigmoid).
     """
 
-    def __init__(self, hidden_dim: int = 20, params: Optional[Dict[str, torch.Tensor]] = None):
+    def __init__(
+        self,
+        hidden_dim: int = 20,
+        init_scale: float = 1e-3,
+        params: Optional[Dict[str, torch.Tensor]] = None,
+    ):
         super().__init__()
         device = get_device()
+        self.hidden_dim = hidden_dim
+        self.init_scale = float(init_scale)
+
         if params is None:
             self.params = {
-                "W1": nn.Parameter(torch.randn(40, hidden_dim, device=device) * 0.01),
-                "b1": nn.Parameter(torch.zeros(hidden_dim, device=device)),
-                "W2": nn.Parameter(torch.randn(hidden_dim, 10, device=device) * 0.01),
-                "b2": nn.Parameter(torch.zeros(10, device=device)),
+                "W1": torch.randn(40, hidden_dim, device=device) * self.init_scale,
+                "b1": torch.zeros(hidden_dim, device=device),
+                "W2": torch.randn(hidden_dim, 10, device=device) * self.init_scale,
+                "b2": torch.zeros(10, device=device),
             }
+            # make them leaf tensors with grad
+            for k in list(self.params.keys()):
+                self.params[k] = detach_var(self.params[k])
         else:
-            self.params = params  # assume already on correct device
+            self.params = params  # assume already on correct device and requires_grad
 
     def all_named_parameters(self):
         return list(self.params.items())
@@ -147,9 +200,8 @@ class LearnedOptimizer(nn.Module):
     """
     Coordinate-wise LSTM optimizer (paper-aligned), with gradient preprocessing.
 
-    We add tanh bounding for stability:
-      update = tanh(out(h))  (bounded in [-1,1])
-      actual param delta = out_mul * update
+    IMPORTANT: notebook version DOES NOT tanh-bound the output.
+    So we return raw linear output as update.
     """
 
     def __init__(self, hidden_sz: int = 20, preproc: bool = True, preproc_factor: float = 10.0):
@@ -168,16 +220,18 @@ class LearnedOptimizer(nn.Module):
         self.out = nn.Linear(hidden_sz, 1)
 
     def _preprocess(self, g: torch.Tensor) -> torch.Tensor:
-        g = g.data
-        out = torch.zeros(g.size(0), 2, device=g.device)
-        keep = (g.abs() >= self.preproc_threshold).squeeze()
+        # Detach path like notebook: use .data to avoid gradient flow through gradient input.
+        gd = g.data
+        out = torch.zeros(gd.size(0), 2, device=gd.device)
+        keep = (gd.abs() >= self.preproc_threshold).squeeze()
 
-        out[:, 0][keep] = (torch.log(g.abs()[keep] + 1e-8) / self.preproc_factor).squeeze()
-        out[:, 1][keep] = torch.sign(g[keep]).squeeze()
+        out[:, 0][keep] = (torch.log(gd.abs()[keep] + 1e-8) / self.preproc_factor).squeeze()
+        out[:, 1][keep] = torch.sign(gd[keep]).squeeze()
 
         out[:, 0][~keep] = -1
-        out[:, 1][~keep] = (math.exp(self.preproc_factor) * g[~keep]).squeeze()
-        return Variable(out)
+        out[:, 1][~keep] = (math.exp(self.preproc_factor) * gd[~keep]).squeeze()
+
+        return out  # plain tensor is fine
 
     def forward(
         self,
@@ -191,9 +245,7 @@ class LearnedOptimizer(nn.Module):
         h0, c0 = self.lstm1(grad, (hidden[0], cell[0]))
         h1, c1 = self.lstm2(h0, (hidden[1], cell[1]))
 
-        out_raw = self.out(h1)
-        update = torch.tanh(out_raw)  # IMPORTANT stability bound
-
+        update = self.out(h1)  # NO tanh
         return update, (h0, h1), (c0, c1)
 
 
@@ -244,6 +296,7 @@ def run_inner_trajectory_get_final_params(
     out_mul: float,
     batch_size: int,
     task_seed: int,
+    init_scale: float,
 ) -> Dict[str, torch.Tensor]:
     """
     Run optimizee training for optim_steps using learned optimizer (no meta-grad),
@@ -253,7 +306,7 @@ def run_inner_trajectory_get_final_params(
     opt_net.eval()
 
     task = MNIST1DTask(x_train, y_train, batch_size=batch_size, task_seed=task_seed, drop_last=True)
-    optimizee = MNIST1DOptimizee()
+    optimizee = MNIST1DOptimizee(init_scale=init_scale)
     params = {k: v for k, v in optimizee.params.items()}  # on device already
 
     n_params = sum(int(np.prod(p.size())) for p in params.values())
@@ -296,7 +349,7 @@ def run_inner_trajectory_get_final_params(
                 new_cell[i][offset:offset + sz] = c_new[i].detach()
 
             new_p = (p + out_mul * update.view_as(p)).detach()
-            new_p.requires_grad_(True)
+            new_p = detach_var(new_p)
             new_params[name] = new_p
 
             offset += sz
@@ -320,7 +373,12 @@ def do_fit(
     out_mul: float = 0.1,
     training: bool = True,
     batch_size: int = 128,
+    init_scale: float = 1e-3,
 ) -> List[float]:
+    """
+    One optimizee trajectory (one task seed). Returns per-step optimizee losses.
+    Notebook-style: uses loss.backward(...) to populate p.grad and then uses p.grad as input.
+    """
     device = get_device()
     if training:
         opt_net.train()
@@ -329,7 +387,7 @@ def do_fit(
         unroll = 1
 
     task = MNIST1DTask(x, y, batch_size=batch_size, task_seed=task_seed, drop_last=True)
-    optimizee = MNIST1DOptimizee()
+    optimizee = MNIST1DOptimizee(init_scale=init_scale)
 
     n_params = _count_params(optimizee)
     hidden = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
@@ -346,6 +404,8 @@ def do_fit(
         losses_ever.append(float(loss.item()))
 
         total_loss = loss if total_loss is None else (total_loss + loss)
+
+        # populate grads on current optimizee params
         loss.backward(retain_graph=training)
 
         offset = 0
@@ -355,10 +415,13 @@ def do_fit(
 
         for name, p in optimizee.all_named_parameters():
             sz = int(np.prod(p.size()))
-            grad = detach_var(p.grad.view(sz, 1))
+            if p.grad is None:
+                raise RuntimeError(f"Gradient is None for param {name}.")
+            grad_in = p.grad.view(sz, 1)
+            grad_in = detach_var(grad_in)  # detach gradient input like notebook
 
             update, h_new, c_new = opt_net(
-                grad,
+                grad_in,
                 [h[offset:offset + sz] for h in hidden],
                 [c[offset:offset + sz] for c in cell],
             )
@@ -378,12 +441,15 @@ def do_fit(
                 total_loss.backward()
                 meta_opt.step()
 
-            optimizee = MNIST1DOptimizee(params={k: detach_var(v) for k, v in new_params.items()})
+            optimizee = MNIST1DOptimizee(
+                init_scale=init_scale,
+                params={k: detach_var(v) for k, v in new_params.items()},
+            )
             hidden = [detach_var(h) for h in new_hidden]
             cell = [detach_var(c) for c in new_cell]
             total_loss = None
         else:
-            optimizee = MNIST1DOptimizee(params=new_params)
+            optimizee = MNIST1DOptimizee(init_scale=init_scale, params=new_params)
             hidden = new_hidden
             cell = new_cell
 
@@ -395,11 +461,19 @@ def train_l2lgdgd(args, run_dir: Path):
     device = get_device()
     set_seed(args.seed)
 
-    opt_net = LearnedOptimizer().to(device)
+    opt_net = LearnedOptimizer(hidden_sz=args.hidden_sz, preproc=(not args.no_preproc)).to(device)
     meta_opt = optim.Adam(opt_net.parameters(), lr=args.lr)
 
-    # FIXED dataset (paper-style): tasks differ only by batch stream
+    # FIXED dataset: tasks differ only by batch stream (shuffle order)
     (xtr, ytr), (xte, yte) = load_mnist1d(length=40, seed=args.data_seed)
+    xtr = _to_N40(xtr).astype(np.float32)
+    xte = _to_N40(xte).astype(np.float32)
+
+    # Optional normalization (recommended for MNIST1D)
+    if args.preprocess_dir is not None:
+        mean, std = load_norm_stats(Path(args.preprocess_dir), args.data_seed)
+        xtr = apply_norm(xtr, mean, std)
+        xte = apply_norm(xte, mean, std)
 
     best_eval_meta_loss = float("inf")
     best_state = None
@@ -417,11 +491,10 @@ def train_l2lgdgd(args, run_dir: Path):
             "report_test_acc",
         ])
 
-    # helper: sample task seeds
+    # helper: sample task seeds (controls shuffle order)
     rng = np.random.RandomState(args.seed)
 
     def sample_task_seed(low: int, high: int) -> int:
-        # inclusive range
         return int(rng.randint(low, high + 1))
 
     for ep in range(args.meta_epochs):
@@ -439,9 +512,10 @@ def train_l2lgdgd(args, run_dir: Path):
                 out_mul=args.out_mul,
                 training=True,
                 batch_size=args.bs,
+                init_scale=args.init_scale,
             )
 
-        # ---- meta-eval loss on held-out task seeds (same dataset, different streams) ----
+        # ---- meta-eval loss on held-out task seeds ----
         eval_losses = []
         for _ in range(args.eval_tasks):
             task_seed = sample_task_seed(args.eval_seed_low, args.eval_seed_high)
@@ -456,11 +530,12 @@ def train_l2lgdgd(args, run_dir: Path):
                 out_mul=args.out_mul,
                 training=False,
                 batch_size=args.bs,
+                init_scale=args.init_scale,
             )
             eval_losses.append(sum(traj))
         eval_meta_loss = float(np.mean(eval_losses))
 
-        # ---- report optimizee performance (pick a few report tasks, average) ----
+        # ---- report optimizee performance (average over report_tasks) ----
         rep_train_losses, rep_train_accs = [], []
         rep_test_losses, rep_test_accs = [], []
 
@@ -474,6 +549,7 @@ def train_l2lgdgd(args, run_dir: Path):
                 out_mul=args.out_mul,
                 batch_size=args.bs,
                 task_seed=task_seed,
+                init_scale=args.init_scale,
             )
             tr_loss, tr_acc = eval_params_on_dataset(final_params, xtr, ytr, batch_size=512)
             te_loss, te_acc = eval_params_on_dataset(final_params, xte, yte, batch_size=512)
@@ -523,7 +599,7 @@ def train_l2lgdgd(args, run_dir: Path):
             torch.save(best_state, run_dir / "best_opt.pt")
 
     result = {
-        "method": "mnist1d_l2lgdgd_taskdist_stream",
+        "method": "mnist1d_l2lgdgd_taskdist_stream_notebooklike",
         "seed": int(args.seed),
         "data_seed": int(args.data_seed),
         "meta_epochs": int(args.meta_epochs),
@@ -535,6 +611,10 @@ def train_l2lgdgd(args, run_dir: Path):
         "lr": float(args.lr),
         "bs": int(args.bs),
         "out_mul": float(args.out_mul),
+        "init_scale": float(args.init_scale),
+        "hidden_sz": int(args.hidden_sz),
+        "preproc": bool(not args.no_preproc),
+        "preprocess_dir": (str(args.preprocess_dir) if args.preprocess_dir is not None else None),
         "train_seed_low": int(args.train_seed_low),
         "train_seed_high": int(args.train_seed_high),
         "eval_seed_low": int(args.eval_seed_low),
@@ -552,6 +632,7 @@ def train_l2lgdgd(args, run_dir: Path):
 
 def build_argparser():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data_seed", type=int, default=42)
 
@@ -562,9 +643,23 @@ def build_argparser():
 
     ap.add_argument("--optim_steps", type=int, default=100)
     ap.add_argument("--unroll", type=int, default=20)
-    ap.add_argument("--lr", type=float, default=3e-3)
+
+    ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--bs", type=int, default=128)
     ap.add_argument("--out_mul", type=float, default=0.1)
+
+    # notebook-like knobs
+    ap.add_argument("--init_scale", type=float, default=1e-3)     # 0.001
+    ap.add_argument("--hidden_sz", type=int, default=20)
+    ap.add_argument("--no_preproc", action="store_true")          # default uses preproc=True
+
+    # IMPORTANT: MNIST1D normalization (recommended)
+    ap.add_argument(
+        "--preprocess_dir",
+        type=str,
+        default=None,
+        help="If set, loads {preprocess_dir}/seed_{data_seed}/norm.json and normalizes x.",
+    )
 
     # task seed ranges (affect only minibatch order)
     ap.add_argument("--train_seed_low", type=int, default=0)
@@ -579,6 +674,7 @@ def build_argparser():
     ap.add_argument("--wandb_project", type=str, default="l2o-online")
     ap.add_argument("--wandb_group", type=str, default="mnist1d_l2lgdgd")
     ap.add_argument("--wandb_run_name", type=str, default=None)
+
     return ap
 
 
@@ -591,6 +687,7 @@ def main():
         f"mnist1d_l2lgdgd_seed{args.seed}_data{args.data_seed}_"
         f"streamTask_train{args.train_seed_low}-{args.train_seed_high}_"
         f"eval{args.eval_seed_low}-{args.eval_seed_high}_"
+        f"lr{args.lr}_init{args.init_scale}_"
         + datetime.now().strftime("%Y%m%d-%H%M%S")
     )
     run_dir = Path(args.runs_dir) / run_name
@@ -619,6 +716,10 @@ def main():
                 "lr": args.lr,
                 "bs": args.bs,
                 "out_mul": args.out_mul,
+                "init_scale": args.init_scale,
+                "hidden_sz": args.hidden_sz,
+                "preproc": (not args.no_preproc),
+                "preprocess_dir": args.preprocess_dir,
                 "train_seed_low": args.train_seed_low,
                 "train_seed_high": args.train_seed_high,
                 "eval_seed_low": args.eval_seed_low,
