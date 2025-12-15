@@ -4,16 +4,16 @@
 """
 MNIST-1D: Learning to Learn by Gradient Descent by Gradient Descent (L2L-GDGD)
 
-- Coordinate-wise learned optimizer (LSTM)
-- Optimizee: 1-hidden-layer MLP with sigmoid (paper-aligned)
-- Data: MNIST-1D (length = 40)
-- Meta-loss: sum of optimizee losses along optimization trajectory
-- Truncated BPTT with unroll
-- Added: argparse + wandb + run_dir logging + checkpoint saving
+Adds:
+- argparse
+- wandb (optional)
+- run_dir outputs
+- per-meta-epoch evaluation of optimizee train/test loss+acc (like your F1/F2/F3 scripts)
 """
 
 import argparse
 import copy
+import csv
 import json
 import math
 import time
@@ -50,11 +50,6 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def w(x: torch.Tensor) -> torch.Tensor:
-    """Move tensor to current device."""
-    return x.to(get_device())
-
-
 def detach_var(v: torch.Tensor) -> torch.Tensor:
     """
     Detach variable from previous graph but keep requires_grad.
@@ -65,7 +60,7 @@ def detach_var(v: torch.Tensor) -> torch.Tensor:
     return out.to(get_device())
 
 
-# ---------------------- MNIST-1D task ----------------------
+# ---------------------- MNIST-1D task (stream) ----------------------
 class MNIST1DLoss:
     """
     Task = data stream.
@@ -79,7 +74,6 @@ class MNIST1DLoss:
         else:
             x, y = xte, yte
 
-        # Always float32 / int64
         x = torch.from_numpy(np.asarray(x, dtype=np.float32))
         y = torch.from_numpy(np.asarray(y, dtype=np.int64))
 
@@ -110,7 +104,7 @@ class MNIST1DOptimizee(nn.Module):
       - So when params is None, we MUST create them on the correct device.
     """
 
-    def __init__(self, hidden_dim: int = 20, params: Optional[Dict[str, nn.Parameter]] = None):
+    def __init__(self, hidden_dim: int = 20, params: Optional[Dict[str, torch.Tensor]] = None):
         super().__init__()
         device = get_device()
         if params is None:
@@ -121,7 +115,7 @@ class MNIST1DOptimizee(nn.Module):
                 "b2": nn.Parameter(torch.zeros(10, device=device)),
             }
         else:
-            self.params = params
+            self.params = params  # assume already on correct device
 
     def all_named_parameters(self):
         return list(self.params.items())
@@ -185,12 +179,121 @@ class LearnedOptimizer(nn.Module):
         return update, (h0, h1), (c0, c1)
 
 
-# ---------------------- Meta-training (single trajectory) ----------------------
-@torch.no_grad()
+# ---------------------- helpers ----------------------
 def _count_params(optimizee: MNIST1DOptimizee) -> int:
     return sum(int(np.prod(p.size())) for _, p in optimizee.all_named_parameters())
 
 
+def forward_logits_with_params(x: torch.Tensor, params: Dict[str, torch.Tensor]) -> torch.Tensor:
+    h = torch.sigmoid(x @ params["W1"] + params["b1"])
+    logits = h @ params["W2"] + params["b2"]
+    return logits
+
+
+@torch.no_grad()
+def eval_params_on_dataset(
+    params: Dict[str, torch.Tensor],
+    x_np: np.ndarray,
+    y_np: np.ndarray,
+    batch_size: int = 512,
+) -> Tuple[float, float]:
+    """
+    Return (loss, acc) on a full dataset.
+    """
+    device = get_device()
+    x = torch.from_numpy(np.asarray(x_np, dtype=np.float32)).to(device)
+    y = torch.from_numpy(np.asarray(y_np, dtype=np.int64)).to(device)
+
+    n = x.size(0)
+    total_loss = 0.0
+    total_correct = 0
+    total = 0
+
+    for i in range(0, n, batch_size):
+        xb = x[i:i + batch_size]
+        yb = y[i:i + batch_size]
+        logits = forward_logits_with_params(xb, params)
+        loss = F.cross_entropy(logits, yb, reduction="sum")
+        total_loss += float(loss.item())
+        total_correct += int((logits.argmax(dim=1) == yb).sum().item())
+        total += int(yb.size(0))
+
+    return total_loss / max(total, 1), total_correct / max(total, 1)
+
+
+def run_inner_trajectory_get_final_params(
+    opt_net: LearnedOptimizer,
+    optim_steps: int,
+    out_mul: float,
+    batch_size: int,
+    data_seed: int,
+) -> Dict[str, torch.Tensor]:
+    """
+    Run optimizee training for optim_steps using learned optimizer (no meta-grad),
+    return final params dict. This is used for reporting train/test loss+acc per meta-epoch.
+    """
+    device = get_device()
+    opt_net.eval()
+
+    loss_obj = MNIST1DLoss(training=True, batch_size=batch_size, data_seed=data_seed)
+    optimizee = MNIST1DOptimizee()
+    params = {k: v for k, v in optimizee.params.items()}  # on device already
+
+    n_params = sum(int(np.prod(p.size())) for p in params.values())
+    hidden = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
+    cell = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
+
+    for _ in range(optim_steps):
+        x, y = loss_obj.sample()
+        x = x.to(device)
+        y = y.to(device)
+
+        # compute loss + grads w.r.t current params
+        logits = forward_logits_with_params(x, params)
+        loss = F.cross_entropy(logits, y)
+
+        grads = torch.autograd.grad(
+            loss,
+            list(params.values()),
+            create_graph=False,
+            retain_graph=False,
+            allow_unused=False,
+        )
+
+        # apply coordinate-wise LSTM update
+        offset = 0
+        new_params: Dict[str, torch.Tensor] = {}
+        new_hidden = [torch.zeros_like(h) for h in hidden]
+        new_cell = [torch.zeros_like(c) for c in cell]
+
+        for (name, p), g in zip(params.items(), grads):
+            sz = int(np.prod(p.size()))
+            grad_vec = g.detach().reshape(sz, 1)
+
+            update, h_new, c_new = opt_net(
+                grad_vec,
+                [h[offset:offset + sz] for h in hidden],
+                [c[offset:offset + sz] for c in cell],
+            )
+
+            for i in range(2):
+                new_hidden[i][offset:offset + sz] = h_new[i].detach()
+                new_cell[i][offset:offset + sz] = c_new[i].detach()
+
+            new_p = (p + out_mul * update.view_as(p)).detach()
+            new_p.requires_grad_(True)
+            new_params[name] = new_p
+
+            offset += sz
+
+        params = new_params
+        hidden = new_hidden
+        cell = new_cell
+
+    return params
+
+
+# ---------------------- Meta-training (with truncated BPTT) ----------------------
 def do_fit(
     opt_net: LearnedOptimizer,
     meta_opt: Optional[optim.Optimizer],
@@ -202,18 +305,17 @@ def do_fit(
     data_seed: int = 42,
 ) -> List[float]:
     """
-    Run one optimizee trajectory for optim_steps steps.
-    Return list of per-step optimizee losses (python floats).
+    One optimizee trajectory. Returns per-step optimizee losses.
     """
     device = get_device()
     if training:
         opt_net.train()
     else:
         opt_net.eval()
-        unroll = 1  # paper-style eval: no unroll training
+        unroll = 1
 
     loss_obj = MNIST1DLoss(training=training, batch_size=batch_size, data_seed=data_seed)
-    optimizee = MNIST1DOptimizee().to(device)  # module itself has no parameters tracked, but OK
+    optimizee = MNIST1DOptimizee()  # params already on device
 
     n_params = _count_params(optimizee)
     hidden = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
@@ -233,15 +335,12 @@ def do_fit(
         loss.backward(retain_graph=training)
 
         offset = 0
-        new_params: Dict[str, nn.Parameter] = {}
+        new_params: Dict[str, torch.Tensor] = {}
         new_hidden = [torch.zeros_like(h) for h in hidden]
         new_cell = [torch.zeros_like(c) for c in cell]
 
         for name, p in optimizee.all_named_parameters():
             sz = int(np.prod(p.size()))
-            if p.grad is None:
-                raise RuntimeError(f"Gradient is None for parameter {name}")
-
             grad = detach_var(p.grad.view(sz, 1))
 
             update, h_new, c_new = opt_net(
@@ -257,7 +356,6 @@ def do_fit(
             new_p = p + out_mul * update.view_as(p)
             new_p.retain_grad()
             new_params[name] = new_p
-
             offset += sz
 
         if step % unroll == 0:
@@ -278,101 +376,156 @@ def do_fit(
     return losses_ever
 
 
-# ---------------------- Meta-training entry ----------------------
-def train_l2lgdgd(
-    seed: int = 0,
-    data_seed: int = 42,
-    meta_epochs: int = 50,
-    inner_loops_per_epoch: int = 20,
-    eval_tasks: int = 10,
-    optim_steps: int = 100,
-    unroll: int = 20,
-    lr: float = 1e-3,
-    batch_size: int = 128,
-    out_mul: float = 0.1,
-    save_dir: Optional[Path] = None,
-    use_wandb: bool = False,
-) -> Tuple[float, Dict]:
-    """
-    Returns:
-      best_loss, best_state_dict
-    """
-    set_seed(seed)
+# ---------------------- Outer loop + logging ----------------------
+def train_l2lgdgd(args, run_dir: Path):
     device = get_device()
+    set_seed(args.seed)
 
     opt_net = LearnedOptimizer().to(device)
-    meta_opt = optim.Adam(opt_net.parameters(), lr=lr)
+    meta_opt = optim.Adam(opt_net.parameters(), lr=args.lr)
 
-    best_loss = float("inf")
-    best_state: Optional[Dict] = None
+    # load full datasets for reporting train/test metrics
+    (xtr, ytr), (xte, yte) = load_mnist1d(length=40, seed=args.data_seed)
 
-    for ep in range(meta_epochs):
+    best_eval_meta_loss = float("inf")
+    best_state = None
+
+    # CSV log like your other scripts
+    train_log_path = run_dir / "train_log.csv"
+    with open(train_log_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "meta_epoch",
+            "elapsed_sec",
+            "eval_meta_loss",
+            "train_loss",
+            "train_acc",
+            "test_loss",
+            "test_acc",
+        ])
+
+    for ep in range(args.meta_epochs):
         # meta-train
-        for _ in range(inner_loops_per_epoch):
+        for _ in range(args.inner_loops_per_epoch):
             do_fit(
                 opt_net,
                 meta_opt,
-                optim_steps=optim_steps,
-                unroll=unroll,
-                out_mul=out_mul,
+                optim_steps=args.optim_steps,
+                unroll=args.unroll,
+                out_mul=args.out_mul,
                 training=True,
-                batch_size=batch_size,
-                data_seed=data_seed,
+                batch_size=args.bs,
+                data_seed=args.data_seed,
             )
 
-        # meta-eval (held-out tasks) – here: re-sampling batches, same distribution
+        # meta-eval loss (original metric)
         eval_losses = []
-        for _ in range(eval_tasks):
+        for _ in range(args.eval_tasks):
             traj = do_fit(
                 opt_net,
                 meta_opt=None,
-                optim_steps=optim_steps,
-                unroll=unroll,
-                out_mul=out_mul,
+                optim_steps=args.optim_steps,
+                unroll=args.unroll,
+                out_mul=args.out_mul,
                 training=False,
-                batch_size=batch_size,
-                data_seed=data_seed,
+                batch_size=args.bs,
+                data_seed=args.data_seed,
             )
             eval_losses.append(sum(traj))
-        eval_loss = float(np.mean(eval_losses))
+        eval_meta_loss = float(np.mean(eval_losses))
 
-        print(f"[MetaEpoch {ep:03d}] eval meta-loss = {eval_loss:.6f}")
+        # NEW: evaluate optimizee performance (train/test loss+acc) after inner training
+        final_params = run_inner_trajectory_get_final_params(
+            opt_net=opt_net,
+            optim_steps=args.optim_steps,
+            out_mul=args.out_mul,
+            batch_size=args.bs,
+            data_seed=args.data_seed,
+        )
+        train_loss, train_acc = eval_params_on_dataset(final_params, xtr, ytr, batch_size=512)
+        test_loss, test_acc = eval_params_on_dataset(final_params, xte, yte, batch_size=512)
 
-        if use_wandb and wandb is not None:
-            wandb.log({"meta_epoch": ep, "eval_meta_loss": eval_loss})
+        elapsed = time.time() - args._start_time
 
-        if eval_loss < best_loss:
-            best_loss = eval_loss
+        print(
+            f"[MetaEpoch {ep:03d}] "
+            f"eval_meta_loss={eval_meta_loss:.6f} "
+            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+            f"test_loss={test_loss:.4f} test_acc={test_acc:.4f}"
+        )
+
+        with open(train_log_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                ep,
+                f"{elapsed:.3f}",
+                f"{eval_meta_loss:.8f}",
+                f"{train_loss:.8f}",
+                f"{train_acc:.6f}",
+                f"{test_loss:.8f}",
+                f"{test_acc:.6f}",
+            ])
+
+        if args.wandb and wandb is not None:
+            wandb.log({
+                "meta_epoch": ep,
+                "eval_meta_loss": eval_meta_loss,
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "test_loss": test_loss,
+                "test_acc": test_acc,
+                "time/elapsed_sec": elapsed,
+            })
+
+        # save best checkpoint by eval_meta_loss (or you也可以改成按 test_acc)
+        if eval_meta_loss < best_eval_meta_loss:
+            best_eval_meta_loss = eval_meta_loss
             best_state = copy.deepcopy(opt_net.state_dict())
+            torch.save(best_state, run_dir / "best_opt.pt")
 
-            if save_dir is not None:
-                save_dir.mkdir(parents=True, exist_ok=True)
-                ckpt_path = save_dir / "best_opt.pt"
-                torch.save(best_state, ckpt_path)
+    # final result
+    result = {
+        "method": "mnist1d_l2lgdgd",
+        "seed": int(args.seed),
+        "data_seed": int(args.data_seed),
+        "meta_epochs": int(args.meta_epochs),
+        "inner_loops_per_epoch": int(args.inner_loops_per_epoch),
+        "eval_tasks": int(args.eval_tasks),
+        "optim_steps": int(args.optim_steps),
+        "unroll": int(args.unroll),
+        "lr": float(args.lr),
+        "bs": int(args.bs),
+        "out_mul": float(args.out_mul),
+        "best_eval_meta_loss": float(best_eval_meta_loss),
+        "device": str(device),
+        "run_dir": str(run_dir),
+        "checkpoint": str(run_dir / "best_opt.pt"),
+    }
+    with open(run_dir / "result.json", "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
 
-    if best_state is None:
-        best_state = opt_net.state_dict()
-
-    return best_loss, best_state
+    return best_eval_meta_loss, best_state
 
 
-# ---------------------- CLI / main ----------------------
 def build_argparser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data_seed", type=int, default=42)
+
     ap.add_argument("--meta_epochs", type=int, default=50)
     ap.add_argument("--inner_loops_per_epoch", type=int, default=20)
     ap.add_argument("--eval_tasks", type=int, default=10)
+
     ap.add_argument("--optim_steps", type=int, default=100)
     ap.add_argument("--unroll", type=int, default=20)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--bs", type=int, default=128, help="batch size")
+    ap.add_argument("--bs", type=int, default=128)
     ap.add_argument("--out_mul", type=float, default=0.1)
-    ap.add_argument("--runs_dir", type=str, default="runs", help="base directory for outputs")
+
+    ap.add_argument("--runs_dir", type=str, default="runs")
 
     # wandb
-    ap.add_argument("--wandb", action="store_true", help="enable wandb logging")
+    ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", type=str, default="l2o-online")
     ap.add_argument("--wandb_group", type=str, default="mnist1d_l2lgdgd")
     ap.add_argument("--wandb_run_name", type=str, default=None)
@@ -382,8 +535,7 @@ def build_argparser():
 def main():
     args = build_argparser().parse_args()
 
-    device = get_device()
-    print(f"[INFO] device = {device}")
+    print(f"[INFO] device = {get_device()}")
 
     run_name = (
         f"mnist1d_l2lgdgd_seed{args.seed}_data{args.data_seed}_"
@@ -393,7 +545,8 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] run_dir = {run_dir}")
 
-    # wandb init
+    args._start_time = time.time()
+
     wandb_run = None
     if args.wandb:
         if wandb is None:
@@ -416,52 +569,14 @@ def main():
             },
         )
 
-    start = time.time()
-    best_loss, best_state = train_l2lgdgd(
-        seed=args.seed,
-        data_seed=args.data_seed,
-        meta_epochs=args.meta_epochs,
-        inner_loops_per_epoch=args.inner_loops_per_epoch,
-        eval_tasks=args.eval_tasks,
-        optim_steps=args.optim_steps,
-        unroll=args.unroll,
-        lr=args.lr,
-        batch_size=args.bs,
-        out_mul=args.out_mul,
-        save_dir=run_dir,
-        use_wandb=bool(args.wandb and wandb is not None),
-    )
-    elapsed = time.time() - start
-
-    print(f"[RESULT] Best meta-loss: {best_loss:.6f}  (elapsed={elapsed/60:.2f} min)")
-
-    # save result json
-    result = {
-        "method": "mnist1d_l2lgdgd",
-        "seed": int(args.seed),
-        "data_seed": int(args.data_seed),
-        "meta_epochs": int(args.meta_epochs),
-        "inner_loops_per_epoch": int(args.inner_loops_per_epoch),
-        "eval_tasks": int(args.eval_tasks),
-        "optim_steps": int(args.optim_steps),
-        "unroll": int(args.unroll),
-        "lr": float(args.lr),
-        "bs": int(args.bs),
-        "out_mul": float(args.out_mul),
-        "best_meta_loss": float(best_loss),
-        "elapsed_sec": float(elapsed),
-        "run_dir": str(run_dir),
-        "device": str(get_device()),
-        "checkpoint": str(run_dir / "best_opt.pt"),
-    }
-    with open(run_dir / "result.json", "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
+    best_loss, _ = train_l2lgdgd(args, run_dir)
+    elapsed = time.time() - args._start_time
+    print(f"[DONE] best eval_meta_loss={best_loss:.6f} elapsed={elapsed/60:.2f} min")
 
     if wandb_run is not None:
-        wandb_run.summary["best_meta_loss"] = float(best_loss)
+        wandb_run.summary["best_eval_meta_loss"] = float(best_loss)
         wandb_run.summary["elapsed_sec"] = float(elapsed)
-        # upload key files
-        for p in [run_dir / "result.json", run_dir / "best_opt.pt"]:
+        for p in [run_dir / "train_log.csv", run_dir / "result.json", run_dir / "best_opt.pt"]:
             if p.exists():
                 wandb.save(str(p))
         wandb_run.finish()
