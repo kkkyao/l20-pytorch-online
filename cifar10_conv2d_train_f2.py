@@ -1,34 +1,33 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PyTorch BF-style (B+F2) online meta-learning on CIFAR-10 with a Conv2D backbone.
--------------------------------------------------------------------------------
+BF-style Step-3 (B+F2) for CIFAR-10 + Conv2D -- ONLINE TRAIN (PyTorch)
+-----------------------------------------------------------------------
 
-This is the CIFAR-10 Conv2D counterpart of the MNIST-1D F2 BF-style code.
+F2 feature:
+  phi_t = [log ||g_t||, log ||m_t||]
+where m_t is an EMA of gradients:
+  m_t = beta * m_{t-1} + (1-beta) * g_t
 
-Step-3 (B+F2):
-  - Maintain an exponential moving average of gradients m_t
-  - Construct feature:
-        phi_t = [log ||g_t||, log ||m_t||]
-  - Learn an effective scalar L_theta from phi_t
-  - Step-size: eta_t = c_base / (L_theta(phi_t) + eps)
-  - Single-step (T=1) online meta-learning on a *single task*.
+Step-size:
+  eta_t = c_base / (L_theta(phi_t) + eps)
 
-Key design:
-  - For each train batch:
-      1) Compute train loss and gradient g_t on the train batch
-      2) Update EMA of gradients m_t
-      3) Sample a val batch, compute val_loss and grad_val
-      4) Compute dot = <grad_val, g_t>
-      5) Define meta_loss = val_loss - eta * dot + small regularizer
-      6) Take one gradient step on theta (parameters of LearnedL)
-      7) With the updated LearnedL, recompute eta and update w
-         using a plain SGD-like step (no momentum): w_{t+1} = w_t - eta * g_t
-  - No separate meta-train/meta-test split:
-      Conv2D network and LearnedL are trained jointly online on CIFAR-10.
-  - Data preprocessing, normalization, and log file naming follow the
-    same conventions as the F1 version, with CIFAR-specific preprocess
-    artifacts under preprocess_dir (e.g., artifacts/cifar10_conv2d_preprocess).
+Online meta-learning loop (single task):
+  For each train batch:
+    1) Compute train loss and gradient g_t on train batch
+    2) Update EMA m_t
+    3) Sample K val batches, compute val_loss and grad_val
+    4) Compute dot = <grad_val, g_t> (averaged over K to reduce noise)
+    5) Define meta_loss = val_loss - eta * dot + small regularizer
+    6) Take one gradient step on theta (parameters of LearnedL)
+    7) With updated LearnedL, recompute eta and update w using SGD-like step
+       with global-norm clipping (+ optional weight decay)
+
+Stability additions (aligned with your F1):
+  - Average meta dot over multiple val batches (--val_meta_batches)
+  - Limit per-step eta relative change (--eta_change_ratio)
+  - Optional weight decay in the manual SGD update (--wd)
+  - Per-epoch eta/L/phi/dot statistics logged to eta_stats_f2.csv
 """
 
 import argparse
@@ -42,7 +41,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from data_cifar10 import load_cifar10  # as defined in data_cifar10.py
+from data_cifar10 import load_cifar10  # your numpy CIFAR-10 loader
 
 # Optional wandb
 try:
@@ -51,16 +50,165 @@ except ImportError:
     wandb = None
 
 
-# ------------------------------- Utilities -------------------------------
+# =============================== Utilities ===============================
+
+def set_seed(seed: int):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_artifacts(preprocess_dir: Path, seed: int):
+    """
+    Load split.json and norm.json from:
+      preprocess_dir/seed_{seed}/
+    """
+    pdir = preprocess_dir / f"seed_{seed}"
+    split_path = pdir / "split.json"
+    norm_path = pdir / "norm.json"
+    meta_path = pdir / "meta.json"
+
+    if not split_path.exists() or not norm_path.exists():
+        raise FileNotFoundError(f"Missing preprocess artifacts in: {pdir}")
+
+    with open(split_path, "r", encoding="utf-8") as f:
+        split = json.load(f)
+    with open(norm_path, "r", encoding="utf-8") as f:
+        norm = json.load(f)
+
+    meta = {}
+    if meta_path.exists():
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+    return split, norm, meta
+
+
+def to_nchw_and_norm(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """
+    Convert CIFAR-10 images to [N, C, H, W] and apply per-channel normalization.
+    """
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim != 4:
+        raise AssertionError(f"Expected CIFAR-10 images with 4 dimensions, got shape {x.shape}")
+
+    # Ensure NCHW layout
+    if x.shape[1] == 3:
+        x_nchw = x
+    elif x.shape[-1] == 3:
+        x_nchw = np.transpose(x, (0, 3, 1, 2))
+    else:
+        raise AssertionError(f"Unexpected CIFAR-10 shape {x.shape}, cannot infer channel dimension.")
+
+    mean = np.array(mean, dtype=np.float32)
+    std = np.array(std, dtype=np.float32)
+
+    if mean.ndim == 1:
+        if mean.shape[0] != x_nchw.shape[1]:
+            raise AssertionError(f"mean length {mean.shape[0]} does not match channels {x_nchw.shape[1]}")
+        mean = mean.reshape(1, -1, 1, 1)
+    if std.ndim == 1:
+        if std.shape[0] != x_nchw.shape[1]:
+            raise AssertionError(f"std length {std.shape[0]} does not match channels {x_nchw.shape[1]}")
+        std = std.reshape(1, -1, 1, 1)
+
+    return (x_nchw - mean) / std
+
+
+def evaluate_on_loader(model, device, loader, criterion):
+    model.eval()
+    losses = []
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            losses.append(float(loss.item()))
+            preds = logits.argmax(dim=1)
+            correct += int((preds == yb).sum().item())
+            total += int(yb.size(0))
+    avg_loss = float(np.mean(losses)) if losses else float("nan")
+    acc = correct / total if total > 0 else 0.0
+    return avg_loss, acc
+
+
+# =========================== Conv2D Backbone ============================
+
+class Conv2DBaseline(nn.Module):
+    """
+    Match the Conv2D backbone used in your F1 script (32/64/128).
+    """
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),  # 16x16
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),  # 8x8
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.global_pool = nn.AdaptiveAvgPool2d(output_size=1)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 10),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.global_pool(x)
+        x = self.classifier(x)
+        return x
+
+
+# ============================ Learned L_theta ============================
+
+class LearnedL(nn.Module):
+    """
+    Learned scalar L_theta for F2 feature:
+      phi = [log ||g||, log ||m||]
+    Output L_theta in [L_min, L_max].
+    """
+    def __init__(self, L_min: float = 1e-3, L_max: float = 1e3, hidden: int = 32):
+        super().__init__()
+        self.L_min = float(L_min)
+        self.L_max = float(L_max)
+        self.fc1 = nn.Linear(2, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.out = nn.Linear(hidden, 1)
+        self.act = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, phi: torch.Tensor) -> torch.Tensor:
+        z = self.act(self.fc1(phi))
+        z = self.act(self.fc2(z))
+        s = self.sigmoid(self.out(z))  # (0,1)
+        return self.L_min + (self.L_max - self.L_min) * s
+
+
+# ========================== Batch Loss Logger ===========================
 
 class BatchLossLogger:
     """
-    Lightweight BatchLossLogger aligned with the CIFAR-10 F1 version.
-
     Writes CSV: curve_f2.csv with schema:
       iter,epoch,loss,method,seed,opt,lr
     """
-
     def __init__(self, run_dir: Path, meta: dict, flush_every: int = 200):
         self.run_dir = Path(run_dir)
         self.meta = meta
@@ -102,201 +250,22 @@ class BatchLossLogger:
         self.rows.clear()
 
 
-def set_seed(s: int):
-    np.random.seed(s)
-    torch.manual_seed(s)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(s)
-
-
-def load_artifacts(preprocess_dir: Path, seed: int):
-    """
-    Load preprocessing artifacts for CIFAR-10 Conv2D:
-
-      - split.json: {train_idx, val_idx}
-      - norm.json:  {mean, std}  (per-channel mean/std on train subset, with x in [0,1])
-      - meta.json:  (optional, for bookkeeping)
-    """
-    pdir = Path(preprocess_dir) / f"seed_{seed}"
-    split_path = pdir / "split.json"
-    norm_path = pdir / "norm.json"
-    meta_path = pdir / "meta.json"
-
-    if not split_path.exists() or not norm_path.exists():
-        raise FileNotFoundError(
-            f"Preprocess artifacts not found under: {pdir}. Run CIFAR-10 preprocess first."
-        )
-
-    with open(split_path, "r", encoding="utf-8") as f:
-        split = json.load(f)
-    with open(norm_path, "r", encoding="utf-8") as f:
-        norm = json.load(f)
-
-    meta = {}
-    if meta_path.exists():
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-
-    return split, norm, meta
-
-
-def to_nchw_and_norm(
-    x: np.ndarray,
-    mean: np.ndarray,
-    std: np.ndarray,
-) -> np.ndarray:
-    """
-    Convert CIFAR-10 images to [N, C, H, W] and apply per-channel normalization.
-
-    Assumptions:
-      - x has shape [N, 32, 32, 3] or [N, 3, 32, 32]
-      - mean, std are 1D per-channel vectors (len=3) computed on x in [0, 1]
-    """
-    x = np.asarray(x, dtype=np.float32)
-
-    if x.ndim != 4:
-        raise AssertionError(
-            f"Expected CIFAR-10 images with 4 dimensions, got shape {x.shape}"
-        )
-
-    # Ensure NCHW layout
-    if x.shape[1] == 3:
-        # Already [N, C, H, W]
-        x_nchw = x
-    elif x.shape[-1] == 3:
-        # [N, H, W, C] -> [N, C, H, W]
-        x_nchw = np.transpose(x, (0, 3, 1, 2))
-    else:
-        raise AssertionError(
-            f"Unexpected CIFAR-10 shape {x.shape}, cannot infer channel dimension."
-        )
-
-    mean = np.array(mean, dtype=np.float32)
-    std = np.array(std, dtype=np.float32)
-
-    # Reshape per-channel stats to [1, C, 1, 1]
-    if mean.ndim == 1:
-        if mean.shape[0] != x_nchw.shape[1]:
-            raise AssertionError(
-                f"mean length {mean.shape[0]} does not match channels {x_nchw.shape[1]}"
-            )
-        mean = mean.reshape(1, -1, 1, 1)
-    if std.ndim == 1:
-        if std.shape[0] != x_nchw.shape[1]:
-            raise AssertionError(
-                f"std length {std.shape[0]} does not match channels {x_nchw.shape[1]}"
-            )
-        std = std.reshape(1, -1, 1, 1)
-
-    x_norm = (x_nchw - mean) / std
-    return x_norm
-
-
-# --------------------------- Conv2D backbone ---------------------------
-
-def build_model(num_channels: int = 3) -> nn.Module:
-    """
-    Conv2D backbone for CIFAR-10.
-
-    Same as in the F1 version:
-
-      - Conv(3 -> 64, 3x3) + ReLU
-      - Conv(64 -> 64, 3x3) + ReLU
-      - MaxPool(2x2)
-      - Conv(64 -> 128, 3x3) + ReLU
-      - Conv(128 -> 128, 3x3) + ReLU
-      - MaxPool(2x2)
-      - GlobalAveragePool2d
-      - FC 128 -> 128 + ReLU
-      - FC 128 -> 10 (logits)
-    """
-
-    class Conv2DCIFAR10(nn.Module):
-        def __init__(self, in_ch: int):
-            super().__init__()
-            self.features = nn.Sequential(
-                nn.Conv2d(in_ch, 64, kernel_size=3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(64, 64, kernel_size=3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.MaxPool2d(kernel_size=2),  # 32x32 -> 16x16
-
-                nn.Conv2d(64, 128, kernel_size=3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(128, 128, kernel_size=3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.MaxPool2d(kernel_size=2),  # 16x16 -> 8x8
-            )
-            self.gap = nn.AdaptiveAvgPool2d(output_size=1)  # [N,128,1,1]
-            self.fc1 = nn.Linear(128, 128)
-            self.fc2 = nn.Linear(128, 10)
-            self.relu = nn.ReLU(inplace=True)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            # x: [N, C, H, W]
-            x = self.features(x)
-            x = self.gap(x)                # [N, 128, 1, 1]
-            x = x.view(x.size(0), -1)      # [N, 128]
-            x = self.fc1(x)
-            x = self.relu(x)
-            logits = self.fc2(x)           # [N, 10]
-            return logits
-
-    return Conv2DCIFAR10(num_channels)
-
-
-# ------------------------- Learned L_theta (B+F2) -------------------------
-
-class LearnedL(nn.Module):
-    """
-    Simple MLP mapping phi = [log ||g||, log ||m||] to a positive scalar L_theta in [L_min, L_max].
-
-    Input:
-      phi: [B, 2]
-    Output:
-      L_theta: [B, 1] in [L_min, L_max]
-    """
-
-    def __init__(self, L_min: float = 1e-3, L_max: float = 1e3, hidden: int = 32):
-        super().__init__()
-        self.L_min = float(L_min)
-        self.L_max = float(L_max)
-        self.fc1 = nn.Linear(2, hidden)
-        self.fc2 = nn.Linear(hidden, hidden)
-        self.fc_out = nn.Linear(hidden, 1)
-        self.relu = nn.ReLU(inplace=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, phi: torch.Tensor) -> torch.Tensor:
-        """
-        phi: [B, 2]
-        return: L_theta in [L_min, L_max], shape [B, 1]
-        """
-        z = self.fc1(phi)
-        z = self.relu(z)
-        z = self.fc2(z)
-        z = self.relu(z)
-        s = self.sigmoid(self.fc_out(z))  # (0, 1)
-        L_theta = self.L_min + (self.L_max - self.L_min) * s
-        return L_theta
-
-
-# ------------------------------ Main ------------------------------
-
+# ================================ Main =================================
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=0, help="training seed")
-    ap.add_argument("--data_seed", type=int, default=42, help="fixed data split seed")
+    ap.add_argument("--data_seed", type=int, default=42, help="data split / preprocess seed")
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--bs", type=int, default=128)
     ap.add_argument(
         "--preprocess_dir",
         type=str,
         default="artifacts/cifar10_conv2d_preprocess",
+        help="directory containing CIFAR-10 preprocess artifacts",
     )
 
-    # Learner / optimizer hyperparameters (aligned with F1, plus EMA beta)
+    # Step-size learner hyperparameters (aligned with F1, plus EMA beta)
     ap.add_argument("--c_base", type=float, default=1.0)
     ap.add_argument("--eps", type=float, default=1e-8)
     ap.add_argument("--Lmin", type=float, default=1e-3)
@@ -306,33 +275,21 @@ def main():
     ap.add_argument("--eta_max", type=float, default=1.0)
     ap.add_argument("--theta_lr", type=float, default=1e-3)
     ap.add_argument("--clip_grad", type=float, default=1.0)
-    ap.add_argument("--beta", type=float, default=0.9,
-                    help="EMA coefficient for gradient moving average m_t")
+    ap.add_argument("--beta", type=float, default=0.9, help="EMA coefficient for gradient moving average m_t")
+
+    # --- Stability / regularization knobs (match F1) ---
+    ap.add_argument("--val_meta_batches", type=int, default=2,
+                    help="number of val mini-batches to average for meta dot (reduces noise)")
+    ap.add_argument("--eta_change_ratio", type=float, default=0.05,
+                    help="max relative change of eta per step, e.g. 0.05 means +/-5%")
+    ap.add_argument("--wd", type=float, default=0.0,
+                    help="weight decay applied in the manual w update (0 disables)")
 
     # WandB logging
-    ap.add_argument(
-        "--wandb",
-        action="store_true",
-        help="enable Weights & Biases logging",
-    )
-    ap.add_argument(
-        "--wandb_project",
-        type=str,
-        default="l2o-cifar10",
-        help="WandB project name",
-    )
-    ap.add_argument(
-        "--wandb_group",
-        type=str,
-        default="cifar10_conv2d_f2_bf1pt",
-        help="WandB group name",
-    )
-    ap.add_argument(
-        "--wandb_run_name",
-        type=str,
-        default=None,
-        help="optional WandB run name, defaults to run_name",
-    )
+    ap.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
+    ap.add_argument("--wandb_project", type=str, default="l2o-cifar10", help="WandB project name")
+    ap.add_argument("--wandb_group", type=str, default="cifar10_conv2d_f2_bf1pt", help="WandB group name")
+    ap.add_argument("--wandb_run_name", type=str, default=None, help="optional WandB run name, defaults to run_name")
 
     args = ap.parse_args()
 
@@ -340,7 +297,9 @@ def main():
     print(f"[INFO] Using device: {device}")
     set_seed(args.seed)
 
-    # Run directory: encode CIFAR-10 + Conv2D + F2
+    # ------------------------------------------------------------------
+    # Run directory
+    # ------------------------------------------------------------------
     run_name = (
         f"cifar10_conv2d_f2_data{args.data_seed}_seed{args.seed}_"
         + datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -349,7 +308,9 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] run_dir = {run_dir}")
 
-    # ---------------- WandB init (optional) ----------------
+    # ------------------------------------------------------------------
+    # WandB init (optional)
+    # ------------------------------------------------------------------
     wandb_run = None
     if args.wandb:
         if wandb is None:
@@ -376,6 +337,9 @@ def main():
             "theta_lr": args.theta_lr,
             "clip_grad": args.clip_grad,
             "beta": args.beta,
+            "val_meta_batches": args.val_meta_batches,
+            "eta_change_ratio": args.eta_change_ratio,
+            "wd": args.wd,
         }
         wandb_run = wandb.init(
             project=args.wandb_project,
@@ -384,20 +348,19 @@ def main():
             config=wandb_config,
         )
 
-    # ---------------- data ----------------
-    # CIFAR-10 loader does not take a `seed` argument.
-    # The train/val split is controlled by split.json under preprocess_dir.
+    # ------------------------------------------------------------------
+    # Load CIFAR-10 and preprocess
+    # ------------------------------------------------------------------
     (xtr, ytr), (xte, yte) = load_cifar10()
 
-    # Cast to float32 in [0, 1] to match how mean/std were computed in preprocess.
-    xtr = np.asarray(xtr, dtype=np.float32) / 255.0   # [N, 32, 32, 3] in [0, 1]
+    xtr = np.asarray(xtr, dtype=np.float32) / 255.0
     xte = np.asarray(xte, dtype=np.float32) / 255.0
     ytr = np.asarray(ytr, dtype=np.int64)
     yte = np.asarray(yte, dtype=np.int64)
 
     split, norm, _ = load_artifacts(Path(args.preprocess_dir), seed=args.data_seed)
-    mean = np.array(norm["mean"], np.float32)  # shape [3]
-    std = np.array(norm["std"], np.float32)    # shape [3]
+    mean = np.array(norm["mean"], np.float32)
+    std = np.array(norm["std"], np.float32)
     train_idx = np.array(split["train_idx"], dtype=np.int64)
     val_idx = np.array(split["val_idx"], dtype=np.int64)
 
@@ -409,7 +372,6 @@ def main():
     x_val = to_nchw_and_norm(x_val_raw, mean, std)
     x_test = to_nchw_and_norm(x_test_raw, mean, std)
 
-    # Conv2D expects [N, C, H, W]
     x_train_t = torch.from_numpy(x_train)
     x_val_t = torch.from_numpy(x_val)
     x_test_t = torch.from_numpy(x_test)
@@ -421,21 +383,10 @@ def main():
     val_dataset = TensorDataset(x_val_t, y_val_t)
     test_dataset = TensorDataset(x_test_t, y_test_t)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.bs,
-        shuffle=True,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.bs,
-        shuffle=True,
-        drop_last=True,
-    )
+    train_loader = DataLoader(train_dataset, batch_size=args.bs, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.bs, shuffle=True, drop_last=True)
 
     def infinite_loader(loader):
-        """Yield batches from a DataLoader forever."""
         while True:
             for batch in loader:
                 yield batch
@@ -445,33 +396,43 @@ def main():
     val_eval_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
     test_eval_loader = DataLoader(test_dataset, batch_size=512, shuffle=False)
 
-    # ---------------- models ----------------
-    net = build_model(num_channels=3).to(device)
-    learner = LearnedL(L_min=args.Lmin, L_max=args.Lmax).to(device)
+    # ------------------------------------------------------------------
+    # Models and optimizers
+    # ------------------------------------------------------------------
+    net = Conv2DBaseline().to(device)
+    learner = LearnedL(L_min=args.Lmin, L_max=args.Lmax, hidden=32).to(device)
     theta_opt = torch.optim.Adam(learner.parameters(), lr=args.theta_lr)
     ce = nn.CrossEntropyLoss()
 
-    # Initialize EMA buffers m_t for each parameter (same shape as params)
     params = list(net.parameters())
+    # EMA buffers m_t
     m_buffers = [torch.zeros_like(p, device=device) for p in params]
 
-    # ---------------- logs ----------------
+    # ------------------------------------------------------------------
+    # Logs
+    # ------------------------------------------------------------------
     curve_logger = BatchLossLogger(
         run_dir,
         meta={
-            "method": "learned_l_f2_cifar10_conv2d",
+            "method": "learned_l_f2_cifar10_conv2d_online_pt",
             "seed": args.seed,
             "opt": "learnedL",
             "lr": args.theta_lr,
         },
     )
     mech_path = run_dir / "mechanism_f2.csv"
+    eta_stats_path = run_dir / "eta_stats_f2.csv"
     train_log_path = run_dir / "train_log_f2.csv"
     time_log_path = run_dir / "time_log_f2.csv"
     result_path = run_dir / "result_f2.json"
 
     with open(mech_path, "w") as f:
         f.write("iter,epoch,eta_t,L_theta,phi_g,phi_m\n")
+    with open(eta_stats_path, "w") as f:
+        f.write(
+            "epoch,eta_mean,eta_std,eta_min,eta_max,eta_p50,eta_p90,eta_p99,"
+            "L_mean,phi_g_mean,phi_m_mean,dot_mean\n"
+        )
     with open(train_log_path, "w") as f:
         f.write("epoch,elapsed_sec,train_loss,val_loss,test_loss,val_acc,test_acc\n")
     with open(time_log_path, "w") as f:
@@ -479,13 +440,18 @@ def main():
 
     global_step = 0
     start_time = time.time()
+    eta_prev = None
 
-    # ---------------- training loop (online meta-learning, F2) ----------------
+    # ------------------------------------------------------------------
+    # Training loop (online meta-learning BF2-style)
+    # ------------------------------------------------------------------
     for epoch in range(args.epochs):
         epoch_start = time.time()
         curve_logger.on_epoch_begin(epoch)
         train_loss_sum = 0.0
         train_batches = 0
+
+        eta_hist, L_hist, phi_g_hist, phi_m_hist, dot_hist = [], [], [], [], []
 
         net.train()
         learner.train()
@@ -494,7 +460,7 @@ def main():
             xb = xb.to(device)
             yb = yb.to(device)
 
-            # --- 1) Train batch: compute g_t ---
+            # 1) train loss and gradients g_t
             logits_tr = net(xb)
             train_loss = ce(logits_tr, yb)
             train_loss_sum += float(train_loss.item())
@@ -506,17 +472,14 @@ def main():
                 create_graph=False,
                 retain_graph=False,
             )
-            grads = [
-                g if g is not None else torch.zeros_like(p)
-                for g, p in zip(grads, params)
-            ]
+            grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(grads, params)]
 
-            # --- 2) Update EMA of gradients: m_t = beta * m_{t-1} + (1 - beta) * g_t ---
+            # 2) update EMA m_t (in-place, detached)
             with torch.no_grad():
-                for i, (m, g) in enumerate(zip(m_buffers, grads)):
-                    m_buffers[i] = args.beta * m + (1.0 - args.beta) * g
+                for m, g in zip(m_buffers, grads):
+                    m.mul_(args.beta).add_(g, alpha=(1.0 - args.beta))
 
-            # --- 3) Compute F2 feature: phi_t = [log ||g_t||, log ||m_t||] ---
+            # 3) F2 feature: [log||g||, log||m||]
             g_norm_sq = sum((g.detach() ** 2).sum() for g in grads)
             g_norm = torch.sqrt(g_norm_sq + args.eps)
 
@@ -525,38 +488,45 @@ def main():
 
             phi_g = torch.log(g_norm + args.eps)
             phi_m = torch.log(m_norm + args.eps)
-            phi = torch.stack([phi_g, phi_m], dim=0).view(1, 2)  # [1, 2]
-
-            # --- 4) Val batch: compute val_loss and grad_val ---
-            xv, yv = next(val_iter)
-            xv = xv.to(device)
-            yv = yv.to(device)
-
-            logits_val = net(xv)
-            val_loss = ce(logits_val, yv)
-            grad_val = torch.autograd.grad(
-                val_loss,
-                params,
-                create_graph=False,
-                retain_graph=False,
-            )
-            grad_val = [
-                gv if gv is not None else torch.zeros_like(p)
-                for gv, p in zip(grad_val, params)
-            ]
-
-            # dot = sum <grad_val, stop_grad(g)>
-            dot = torch.zeros([], device=device, dtype=torch.float32)
-            for gv, g in zip(grad_val, grads):
-                dot = dot + (gv.float() * g.detach().float()).sum()
-
-            # --- 5) Online meta-update on theta using F2 feature ---
+            phi = torch.stack([phi_g, phi_m], dim=0).view(1, 2)
             phi_in = phi.to(device)
-            L_theta = learner(phi_in)  # [1, 1]
+
+            # 4) meta signal: average over K val batches
+            K = max(1, int(args.val_meta_batches))
+            dot_sum = torch.zeros([], device=device, dtype=torch.float32)
+            val_loss_sum = torch.zeros([], device=device, dtype=torch.float32)
+
+            for _ in range(K):
+                xv, yv = next(val_iter)
+                xv = xv.to(device)
+                yv = yv.to(device)
+
+                logits_val = net(xv)
+                val_loss_k = ce(logits_val, yv)
+                val_loss_sum = val_loss_sum + val_loss_k.detach()
+
+                grad_val = torch.autograd.grad(
+                    val_loss_k,
+                    params,
+                    create_graph=False,
+                    retain_graph=False,
+                )
+                grad_val = [gv if gv is not None else torch.zeros_like(p) for gv, p in zip(grad_val, params)]
+
+                dot_k = torch.zeros([], device=device, dtype=torch.float32)
+                for gv, g in zip(grad_val, grads):
+                    dot_k = dot_k + (gv.float() * g.detach().float()).sum()
+
+                dot_sum = dot_sum + dot_k
+
+            dot = dot_sum / float(K)
+            val_loss = val_loss_sum / float(K)
+
+            # 5) meta-update theta
+            L_theta = learner(phi_in)  # [1,1]
             eta = args.c_base / (L_theta + args.eps)
 
             if global_step < args.warmup_steps:
-                # Warmup logic aligned with the F1 implementation
                 warmup_max = min(
                     args.eta_max,
                     1.2 * args.c_base / (args.Lmin + args.eps),
@@ -565,90 +535,84 @@ def main():
             else:
                 eta = torch.clamp(eta, min=args.eta_min, max=args.eta_max)
 
-            eta_scalar = eta.squeeze()  # scalar tensor
+            eta_scalar = eta.squeeze()
 
-            # meta_loss = val_loss - eta * dot + small regularizer
             meta_loss = val_loss.detach() - eta_scalar * dot.detach()
-            meta_loss = meta_loss + 1e-4 * torch.mean(
-                torch.square(torch.log(L_theta + args.eps))
-            )
+            meta_loss = meta_loss + 1e-4 * torch.mean(torch.square(torch.log(L_theta + args.eps)))
 
             theta_opt.zero_grad()
             meta_loss.backward()
             theta_opt.step()
 
-            # --- 6) Clip g and update w using the *updated* theta (still pure SGD on g_t) ---
-            # global norm for grads (for clipping)
-            g_norm_for_clip = torch.sqrt(
-                sum((g.detach() ** 2).sum() for g in grads) + 1e-12
-            )
+            # 6) clip grads + update w using updated theta (eta limiter + wd)
+            g_norm_for_clip = torch.sqrt(sum((g.detach() ** 2).sum() for g in grads) + 1e-12)
             if args.clip_grad is not None and args.clip_grad > 0.0:
-                if g_norm_for_clip.item() > args.clip_grad:
-                    clip_coef = args.clip_grad / float(g_norm_for_clip.item())
-                else:
-                    clip_coef = 1.0
+                clip_coef = args.clip_grad / float(g_norm_for_clip.item()) if g_norm_for_clip.item() > args.clip_grad else 1.0
             else:
                 clip_coef = 1.0
 
             with torch.no_grad():
                 L_now = learner(phi_in)
                 eta_now = args.c_base / (L_now + args.eps)
+
                 if global_step < args.warmup_steps:
                     warmup_max = min(
                         args.eta_max,
                         1.2 * args.c_base / (args.Lmin + args.eps),
                     )
-                    eta_now = torch.clamp(
-                        eta_now, min=args.eta_min, max=warmup_max
-                    )
+                    eta_now = torch.clamp(eta_now, min=args.eta_min, max=warmup_max)
                 else:
-                    eta_now = torch.clamp(
-                        eta_now, min=args.eta_min, max=args.eta_max
-                    )
+                    eta_now = torch.clamp(eta_now, min=args.eta_min, max=args.eta_max)
+
                 eta_scalar_now = eta_now.squeeze()
+
+                # per-step eta change limiter
+                if eta_prev is None:
+                    eta_limited = eta_scalar_now
+                else:
+                    r = float(args.eta_change_ratio)
+                    if r > 0.0:
+                        lo = eta_prev * (1.0 - r)
+                        hi = eta_prev * (1.0 + r)
+                        eta_limited = torch.clamp(eta_scalar_now, min=lo, max=hi)
+                    else:
+                        eta_limited = eta_scalar_now
+
+                eta_limited = torch.clamp(eta_limited, min=args.eta_min, max=args.eta_max)
+                eta_prev = eta_limited.detach()
 
                 for p, g in zip(params, grads):
                     g_update = g * clip_coef
-                    p.data -= eta_scalar_now.to(p.device).to(p.dtype) * g_update
+                    if args.wd is not None and args.wd > 0.0:
+                        g_update = g_update + args.wd * p.data
+                    p.data -= eta_limited.to(p.device).to(p.dtype) * g_update
 
-                # Mechanism log
+                # mechanism log
                 with open(mech_path, "a") as f:
                     f.write(
                         f"{global_step},{epoch},"
-                        f"{float(eta_scalar_now.item()):.6g},"
+                        f"{float(eta_limited.item()):.6g},"
                         f"{float(L_now.squeeze().item()):.6g},"
                         f"{float(phi_g.item()):.6g},"
                         f"{float(phi_m.item()):.6g}\n"
                     )
 
+            # per-step stats
+            eta_hist.append(float(eta_limited.item()))
+            L_hist.append(float(L_now.squeeze().item()))
+            phi_g_hist.append(float(phi_g.item()))
+            phi_m_hist.append(float(phi_m.item()))
+            dot_hist.append(float(dot.detach().item()))
+
             curve_logger.on_train_batch_end(float(train_loss.item()))
             global_step += 1
 
-        # --- Epoch end evaluation (train loss, val/test loss + acc) ---
+        # ------------------------------------------------------------------
+        # Epoch-level evaluation
+        # ------------------------------------------------------------------
         train_loss_epoch = train_loss_sum / max(train_batches, 1)
-
-        def eval_model(data_loader):
-            net.eval()
-            losses = []
-            correct = 0
-            total = 0
-            with torch.no_grad():
-                for xb_eval, yb_eval in data_loader:
-                    xb_eval = xb_eval.to(device)
-                    yb_eval = yb_eval.to(device)
-                    logits_eval = net(xb_eval)
-                    loss_eval = ce(logits_eval, yb_eval)
-                    losses.append(float(loss_eval.item()))
-                    preds = logits_eval.argmax(dim=1)
-                    correct += (preds == yb_eval).sum().item()
-                    total += yb_eval.size(0)
-            return (
-                np.mean(losses) if losses else float("nan"),
-                correct / max(total, 1),
-            )
-
-        val_loss_epoch, val_acc = eval_model(val_eval_loader)
-        test_loss_epoch, test_acc = eval_model(test_eval_loader)
+        val_loss_epoch, val_acc = evaluate_on_loader(net, device, val_eval_loader, ce)
+        test_loss_epoch, test_acc = evaluate_on_loader(net, device, test_eval_loader, ce)
 
         epoch_elapsed = time.time() - epoch_start
         total_elapsed = time.time() - start_time
@@ -665,15 +629,41 @@ def main():
         with open(time_log_path, "a") as f:
             f.write(f"{epoch},{epoch_elapsed:.3f},{total_elapsed:.3f}\n")
 
+        # epoch-level eta stats
+        eta_arr = np.asarray(eta_hist, dtype=np.float64) if eta_hist else np.asarray([np.nan])
+        L_arr = np.asarray(L_hist, dtype=np.float64) if L_hist else np.asarray([np.nan])
+        pg_arr = np.asarray(phi_g_hist, dtype=np.float64) if phi_g_hist else np.asarray([np.nan])
+        pm_arr = np.asarray(phi_m_hist, dtype=np.float64) if phi_m_hist else np.asarray([np.nan])
+        dot_arr = np.asarray(dot_hist, dtype=np.float64) if dot_hist else np.asarray([np.nan])
+
+        eta_mean = float(np.nanmean(eta_arr))
+        eta_std = float(np.nanstd(eta_arr))
+        eta_minv = float(np.nanmin(eta_arr))
+        eta_maxv = float(np.nanmax(eta_arr))
+        eta_p50 = float(np.nanpercentile(eta_arr, 50))
+        eta_p90 = float(np.nanpercentile(eta_arr, 90))
+        eta_p99 = float(np.nanpercentile(eta_arr, 99))
+        L_mean = float(np.nanmean(L_arr))
+        phi_g_mean = float(np.nanmean(pg_arr))
+        phi_m_mean = float(np.nanmean(pm_arr))
+        dot_mean = float(np.nanmean(dot_arr))
+
+        with open(eta_stats_path, "a") as f:
+            f.write(
+                f"{epoch},{eta_mean:.8g},{eta_std:.8g},{eta_minv:.8g},{eta_maxv:.8g},"
+                f"{eta_p50:.8g},{eta_p90:.8g},{eta_p99:.8g},"
+                f"{L_mean:.8g},{phi_g_mean:.8g},{phi_m_mean:.8g},{dot_mean:.8g}\n"
+            )
+
         print(
             f"[CIFAR10-Conv2D-F2-PT EPOCH {epoch}] "
             f"time={epoch_elapsed:.2f}s total={total_elapsed/60:.2f}min "
             f"train={train_loss_epoch:.4f} "
             f"val={val_loss_epoch:.4f} test={test_loss_epoch:.4f} "
-            f"val_acc={val_acc:.4f} test_acc={test_acc:.4f}"
+            f"val_acc={val_acc:.4f} test_acc={test_acc:.4f} "
+            f"eta_mean={eta_mean:.3g} eta_p99={eta_p99:.3g}"
         )
 
-        # WandB logging per epoch
         if wandb_run is not None:
             wandb.log(
                 {
@@ -685,13 +675,24 @@ def main():
                     "test_acc": test_acc,
                     "time/epoch_sec": epoch_elapsed,
                     "time/total_sec": total_elapsed,
+                    "eta/mean": eta_mean,
+                    "eta/std": eta_std,
+                    "eta/min": eta_minv,
+                    "eta/max": eta_maxv,
+                    "eta/p90": eta_p90,
+                    "eta/p99": eta_p99,
+                    "meta/dot_mean": dot_mean,
+                    "phi/phi_g_mean": phi_g_mean,
+                    "phi/phi_m_mean": phi_m_mean,
                 }
             )
 
     curve_logger.on_train_end()
     total_time = time.time() - start_time
 
-    # ---------------- final eval on full test set ----------------
+    # ------------------------------------------------------------------
+    # Final evaluation on full test set
+    # ------------------------------------------------------------------
     net.eval()
     with torch.no_grad():
         logits_test = net(x_test_t.to(device))
@@ -700,14 +701,14 @@ def main():
         final_test_acc = (preds_test == y_test_t.to(device)).float().mean().item()
 
     print(
-        f"[RESULT-CIFAR10-Conv2D-F2-PT] TestAcc={final_test_acc:.4f} "
-        f"TestLoss={final_test_loss:.4f} "
+        f"[RESULT-CIFAR10-Conv2D-F2-PT] "
+        f"TestAcc={final_test_acc:.4f} TestLoss={final_test_loss:.4f} "
         f"(Total time={total_time/60:.2f} min)"
     )
 
     result = {
+        "stage": "online-train",
         "dataset": "CIFAR-10 (Conv2D)",
-        "backbone": "Conv2D",
         "method": "learned_l_f2_cifar10_conv2d_online_pt",
         "epochs": int(args.epochs),
         "bs": int(args.bs),
@@ -729,27 +730,28 @@ def main():
             "theta_lr": args.theta_lr,
             "clip_grad": args.clip_grad,
             "beta": args.beta,
+            "val_meta_batches": args.val_meta_batches,
+            "eta_change_ratio": args.eta_change_ratio,
+            "wd": args.wd,
         },
     }
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
 
-    # WandB summary + upload files
     if wandb_run is not None:
         wandb.run.summary["final_test_acc"] = float(final_test_acc)
         wandb.run.summary["final_test_loss"] = float(final_test_loss)
         wandb.run.summary["total_time_sec"] = float(total_time)
-
         for p in [
             curve_logger.curve_path,
             mech_path,
+            eta_stats_path,
             train_log_path,
             time_log_path,
             result_path,
         ]:
             if Path(p).exists():
                 wandb.save(str(p))
-
         wandb_run.finish()
 
 

@@ -1,34 +1,14 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 PyTorch BF-style (B+F2) online meta-learning on CIFAR-10 with a ResNet-18 backbone.
 -----------------------------------------------------------------------------------
 
-This script is the CIFAR-10 ResNet-18 counterpart of the MNIST-1D Conv1D F2 BF-style code.
-
-Step-3 (B+F2):
-  - Maintain an exponential moving average of gradients m_t
-  - Learn an effective scalar L_theta from feature:
-        phi_t = [log ||g_t||, log ||m_t||]
-  - Step-size: eta_t = c_base / (L_theta(phi_t) + eps)
-  - Single-step (T=1) online meta-learning on a *single task* (CIFAR-10).
-
-Key design:
-  - For each train batch:
-      1) Compute train loss and gradient g_t on the train batch
-      2) Update EMA of gradients m_t
-      3) Build feature phi_t from g_t and m_t
-      4) Sample a val batch, compute val_loss and grad_val
-      5) Compute dot = <grad_val, m_t> (direction = momentum)
-      6) Define meta_loss = val_loss - eta * dot + small regularizer
-      7) Take one gradient step on theta (parameters of LearnedL)
-      8) With the updated LearnedL, recompute eta and update w
-         using the momentum direction m_t with global-norm clipping
-  - No separate meta-train/meta-test split:
-      ResNet-18 and LearnedL are trained jointly online on the same CIFAR-10 task.
-  - Data preprocessing, normalization, and log file naming are aligned
-    with the Conv2D / ResNet F1 implementations, using artifacts under
-    preprocess_dir (e.g. artifacts/cifar10_conv2d_preprocess/seed_{data_seed}).
+Aligned with the stabilized BF variants:
+  - Average meta dot/val_loss over multiple val batches (--val_meta_batches)
+  - Limit per-step eta relative change (--eta_change_ratio)
+  - Optional weight decay in the manual w update (--wd)
+  - Per-epoch eta/L/phi/dot stats logged to eta_stats_f2.csv
 """
 
 import argparse
@@ -42,9 +22,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from data_cifar10 import load_cifar10  # your existing CIFAR-10 loader
+from data_cifar10 import load_cifar10
 
-# Optional wandb
 try:
     import wandb  # type: ignore
 except ImportError:
@@ -55,12 +34,9 @@ except ImportError:
 
 class BatchLossLogger:
     """
-    Lightweight BatchLossLogger aligned with MNIST-1D / CIFAR-10 BF F* code.
-
     Writes CSV: curve_f2.csv with schema:
       iter,epoch,loss,method,seed,opt,lr
     """
-
     def __init__(self, run_dir: Path, meta: dict, flush_every: int = 200):
         self.run_dir = Path(run_dir)
         self.meta = meta
@@ -110,22 +86,13 @@ def set_seed(s: int):
 
 
 def load_artifacts(preprocess_dir: Path, seed: int):
-    """
-    Load preprocessing artifacts for CIFAR-10 Conv2D/ResNet:
-
-      - split.json: {train_idx, val_idx}
-      - norm.json:  {mean, std} (per-channel stats on train subset, x in [0,1])
-      - meta.json:  (optional, for bookkeeping)
-    """
     pdir = Path(preprocess_dir) / f"seed_{seed}"
     split_path = pdir / "split.json"
     norm_path = pdir / "norm.json"
     meta_path = pdir / "meta.json"
 
     if not split_path.exists() or not norm_path.exists():
-        raise FileNotFoundError(
-            f"Preprocess artifacts not found under: {pdir}. Run CIFAR-10 preprocess first."
-        )
+        raise FileNotFoundError(f"Preprocess artifacts not found under: {pdir}")
 
     with open(split_path, "r", encoding="utf-8") as f:
         split = json.load(f)
@@ -140,127 +107,77 @@ def load_artifacts(preprocess_dir: Path, seed: int):
     return split, norm, meta
 
 
-def to_nchw_and_norm(
-    x: np.ndarray,
-    mean: np.ndarray,
-    std: np.ndarray,
-) -> np.ndarray:
-    """
-    Convert CIFAR-10 images to [N, C, H, W] and apply per-channel normalization.
-
-    Assumptions:
-      - x has shape [N, 32, 32, 3] or [N, 3, 32, 32]
-      - mean, std are 1D per-channel vectors (len=3) computed on x in [0, 1]
-    """
+def to_nchw_and_norm(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
-
     if x.ndim != 4:
-        raise AssertionError(
-            f"Expected CIFAR-10 images with 4 dimensions, got shape {x.shape}"
-        )
+        raise AssertionError(f"Expected CIFAR-10 images with 4 dimensions, got shape {x.shape}")
 
-    # Ensure NCHW layout
     if x.shape[1] == 3:
-        # Already [N, C, H, W]
         x_nchw = x
     elif x.shape[-1] == 3:
-        # [N, H, W, C] -> [N, C, H, W]
         x_nchw = np.transpose(x, (0, 3, 1, 2))
     else:
-        raise AssertionError(
-            f"Unexpected CIFAR-10 shape {x.shape}, cannot infer channel dimension."
-        )
+        raise AssertionError(f"Unexpected CIFAR-10 shape {x.shape}, cannot infer channel dimension.")
 
-    mean = np.array(mean, dtype=np.float32)
-    std = np.array(std, dtype=np.float32)
+    mean = np.array(mean, dtype=np.float32).reshape(1, -1, 1, 1)
+    std = np.array(std, dtype=np.float32).reshape(1, -1, 1, 1)
+    return (x_nchw - mean) / std
 
-    # Reshape per-channel stats to [1, C, 1, 1]
-    if mean.ndim == 1:
-        if mean.shape[0] != x_nchw.shape[1]:
-            raise AssertionError(
-                f"mean length {mean.shape[0]} does not match channels {x_nchw.shape[1]}"
-            )
-        mean = mean.reshape(1, -1, 1, 1)
-    if std.ndim == 1:
-        if std.shape[0] != x_nchw.shape[1]:
-            raise AssertionError(
-                f"std length {std.shape[0]} does not match channels {x_nchw.shape[1]}"
-            )
-        std = std.reshape(1, -1, 1, 1)
 
-    x_norm = (x_nchw - mean) / std
-    return x_norm
+def evaluate_on_loader(model, device, loader, criterion):
+    model.eval()
+    losses = []
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            losses.append(float(loss.item()))
+            preds = logits.argmax(dim=1)
+            correct += int((preds == yb).sum().item())
+            total += int(yb.size(0))
+    avg_loss = float(np.mean(losses)) if losses else float("nan")
+    acc = correct / total if total > 0 else 0.0
+    return avg_loss, acc
 
 
 # --------------------------- ResNet-18 backbone ---------------------------
 
 class BasicBlock(nn.Module):
-    """
-    Standard BasicBlock for ResNet-18, adapted to CIFAR-10:
-      - No downsampling in the first block of each stage unless stride != 1 or channel change.
-    """
-
     expansion = 1
-
     def __init__(self, in_planes, planes, stride=1):
         super().__init__()
-        self.conv1 = nn.Conv2d(
-            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
-        )
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(
-            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
-        )
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
 
         self.downsample = None
         if stride != 1 or in_planes != planes * self.expansion:
             self.downsample = nn.Sequential(
-                nn.Conv2d(
-                    in_planes,
-                    planes * self.expansion,
-                    kernel_size=1,
-                    stride=stride,
-                    bias=False,
-                ),
+                nn.Conv2d(in_planes, planes * self.expansion, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(planes * self.expansion),
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
         if self.downsample is not None:
             identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
+        out = self.relu(out + identity)
         return out
 
 
 class ResNet18CIFAR(nn.Module):
-    """
-    ResNet-18 variant for CIFAR-10 (32x32 inputs):
-
-      - First conv: 3x3, stride=1, no maxpool
-      - 4 stages: [2,2,2,2] BasicBlocks with channels [64,128,256,512]
-      - Global average pooling and a linear 512->10 classifier
-    """
-
     def __init__(self, num_classes: int = 10):
         super().__init__()
         self.in_planes = 64
-
-        self.conv1 = nn.Conv2d(
-            3, 64, kernel_size=3, stride=1, padding=1, bias=False
-        )
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
 
@@ -273,32 +190,24 @@ class ResNet18CIFAR(nn.Module):
         self.fc = nn.Linear(512 * BasicBlock.expansion, num_classes)
 
     def _make_layer(self, planes, blocks, stride):
-        layers = []
-        layers.append(BasicBlock(self.in_planes, planes, stride))
+        layers = [BasicBlock(self.in_planes, planes, stride)]
         self.in_planes = planes * BasicBlock.expansion
         for _ in range(1, blocks):
             layers.append(BasicBlock(self.in_planes, planes, stride=1))
         return nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [N, 3, 32, 32]
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-
-        x = self.layer1(x)  # 32x32
-        x = self.layer2(x)  # 16x16
-        x = self.layer3(x)  # 8x8
-        x = self.layer4(x)  # 4x4
-
-        x = self.avgpool(x)           # [N, 512, 1, 1]
-        x = torch.flatten(x, 1)       # [N, 512]
-        logits = self.fc(x)           # [N, 10]
-        return logits
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        return self.fc(x)
 
 
 def build_model() -> nn.Module:
-    """Build a ResNet-18 backbone for CIFAR-10."""
     return ResNet18CIFAR(num_classes=10)
 
 
@@ -306,14 +215,8 @@ def build_model() -> nn.Module:
 
 class LearnedL(nn.Module):
     """
-    Simple MLP mapping phi = [log ||g||, log ||m||] to a positive scalar L_theta in [L_min, L_max].
-
-    Input:
-      phi: [B, 2]
-    Output:
-      L_theta: [B, 1] in [L_min, L_max]
+    phi = [log ||g||, log ||m||] -> L_theta in [Lmin, Lmax]
     """
-
     def __init__(self, L_min: float = 1e-3, L_max: float = 1e3, hidden: int = 32):
         super().__init__()
         self.L_min = float(L_min)
@@ -325,36 +228,23 @@ class LearnedL(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, phi: torch.Tensor) -> torch.Tensor:
-        """
-        phi: [B, 2]
-        return: L_theta in [L_min, L_max], shape [B, 1]
-        """
-        z = self.fc1(phi)
-        z = self.relu(z)
-        z = self.fc2(z)
-        z = self.relu(z)
-        s = self.sigmoid(self.fc_out(z))  # (0, 1)
-        L_theta = self.L_min + (self.L_max - self.L_min) * s
-        return L_theta
+        z = self.relu(self.fc1(phi))
+        z = self.relu(self.fc2(z))
+        s = self.sigmoid(self.fc_out(z))
+        return self.L_min + (self.L_max - self.L_min) * s
 
 
 # ------------------------------ Main ------------------------------
 
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seed", type=int, default=0, help="training seed")
-    ap.add_argument("--data_seed", type=int, default=42, help="fixed data split seed")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--data_seed", type=int, default=42)
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--bs", type=int, default=128)
-    ap.add_argument(
-        "--preprocess_dir",
-        type=str,
-        default="artifacts/cifar10_conv2d_preprocess",
-        help="directory containing CIFAR-10 split.json / norm.json",
-    )
+    ap.add_argument("--preprocess_dir", type=str, default="artifacts/cifar10_conv2d_preprocess")
 
-    # Learner / optimizer hyperparameters (aligned with F1, plus momentum beta)
+    # core knobs
     ap.add_argument("--c_base", type=float, default=1.0)
     ap.add_argument("--eps", type=float, default=1e-8)
     ap.add_argument("--Lmin", type=float, default=1e-3)
@@ -364,37 +254,21 @@ def main():
     ap.add_argument("--eta_max", type=float, default=1.0)
     ap.add_argument("--theta_lr", type=float, default=1e-3)
     ap.add_argument("--clip_grad", type=float, default=1.0)
-    ap.add_argument(
-        "--beta",
-        type=float,
-        default=0.9,
-        help="EMA coefficient for gradient moving average m_t",
-    )
+    ap.add_argument("--beta", type=float, default=0.9, help="EMA coefficient for gradient moving average m_t")
 
-    # WandB logging
-    ap.add_argument(
-        "--wandb",
-        action="store_true",
-        help="enable Weights & Biases logging",
-    )
-    ap.add_argument(
-        "--wandb_project",
-        type=str,
-        default="l2o-cifar10",
-        help="WandB project name",
-    )
-    ap.add_argument(
-        "--wandb_group",
-        type=str,
-        default="cifar10_resnet18_f2_bf2pt",
-        help="WandB group name",
-    )
-    ap.add_argument(
-        "--wandb_run_name",
-        type=str,
-        default=None,
-        help="optional WandB run name, defaults to run_name",
-    )
+    # aligned stability / regularization knobs
+    ap.add_argument("--val_meta_batches", type=int, default=2,
+                    help="number of val mini-batches to average for meta dot (reduces noise)")
+    ap.add_argument("--eta_change_ratio", type=float, default=0.05,
+                    help="max relative change of eta per step, e.g. 0.05 means +/-5%")
+    ap.add_argument("--wd", type=float, default=0.0,
+                    help="weight decay applied in the manual w update (0 disables)")
+
+    # wandb
+    ap.add_argument("--wandb", action="store_true")
+    ap.add_argument("--wandb_project", type=str, default="l2o-cifar10")
+    ap.add_argument("--wandb_group", type=str, default="cifar10_resnet18_f2_bf2pt")
+    ap.add_argument("--wandb_run_name", type=str, default=None)
 
     args = ap.parse_args()
 
@@ -402,7 +276,6 @@ def main():
     print(f"[INFO] Using device: {device}")
     set_seed(args.seed)
 
-    # Run directory: encode CIFAR-10 + ResNet18 + F2
     run_name = (
         f"cifar10_resnet18_f2_data{args.data_seed}_seed{args.seed}_"
         + datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -411,129 +284,103 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] run_dir = {run_dir}")
 
-    # ---------------- WandB init (optional) ----------------
     wandb_run = None
     if args.wandb:
         if wandb is None:
-            raise RuntimeError(
-                "wandb is not installed, but --wandb was passed. "
-                "Install via `pip install wandb` or disable --wandb."
-            )
-        wandb_config = {
-            "stage": "online-train",
-            "dataset": "CIFAR-10",
-            "backbone": "ResNet18",
-            "method": "learned_l_f2_cifar10_resnet18_online_pt",
-            "seed": args.seed,
-            "data_seed": args.data_seed,
-            "epochs": args.epochs,
-            "batch_size": args.bs,
-            "c_base": args.c_base,
-            "eps": args.eps,
-            "Lmin": args.Lmin,
-            "Lmax": args.Lmax,
-            "warmup_steps": args.warmup_steps,
-            "eta_min": args.eta_min,
-            "eta_max": args.eta_max,
-            "theta_lr": args.theta_lr,
-            "clip_grad": args.clip_grad,
-            "beta": args.beta,
-        }
+            raise RuntimeError("wandb is not installed, but --wandb was passed.")
         wandb_run = wandb.init(
             project=args.wandb_project,
             group=args.wandb_group,
             name=args.wandb_run_name or run_name,
-            config=wandb_config,
+            config={
+                "stage": "online-train",
+                "dataset": "CIFAR-10",
+                "backbone": "ResNet18",
+                "method": "learned_l_f2_cifar10_resnet18_online_pt",
+                "seed": args.seed,
+                "data_seed": args.data_seed,
+                "epochs": args.epochs,
+                "batch_size": args.bs,
+                "c_base": args.c_base,
+                "eps": args.eps,
+                "Lmin": args.Lmin,
+                "Lmax": args.Lmax,
+                "warmup_steps": args.warmup_steps,
+                "eta_min": args.eta_min,
+                "eta_max": args.eta_max,
+                "theta_lr": args.theta_lr,
+                "clip_grad": args.clip_grad,
+                "beta": args.beta,
+                "val_meta_batches": args.val_meta_batches,
+                "eta_change_ratio": args.eta_change_ratio,
+                "wd": args.wd,
+            },
         )
 
-    # ---------------- data ----------------
-    # CIFAR-10 loader does not take a `seed` argument.
-    # The train/val split is controlled by split.json under preprocess_dir.
+    # data
     (xtr, ytr), (xte, yte) = load_cifar10()
-
-    # Cast to float32 in [0, 1] to match how mean/std were computed in preprocess.
-    xtr = np.asarray(xtr, dtype=np.float32) / 255.0   # [N, 32, 32, 3] in [0, 1]
+    xtr = np.asarray(xtr, dtype=np.float32) / 255.0
     xte = np.asarray(xte, dtype=np.float32) / 255.0
     ytr = np.asarray(ytr, dtype=np.int64)
     yte = np.asarray(yte, dtype=np.int64)
 
     split, norm, _ = load_artifacts(Path(args.preprocess_dir), seed=args.data_seed)
-    mean = np.array(norm["mean"], np.float32)  # shape [3]
-    std = np.array(norm["std"], np.float32)    # shape [3]
+    mean = np.array(norm["mean"], np.float32)
+    std = np.array(norm["std"], np.float32)
     train_idx = np.array(split["train_idx"], dtype=np.int64)
     val_idx = np.array(split["val_idx"], dtype=np.int64)
 
-    x_train_raw, y_train = xtr[train_idx], ytr[train_idx]
-    x_val_raw, y_val = xtr[val_idx], ytr[val_idx]
-    x_test_raw, y_test = xte, yte
+    x_train = to_nchw_and_norm(xtr[train_idx], mean, std)
+    y_train = ytr[train_idx]
+    x_val = to_nchw_and_norm(xtr[val_idx], mean, std)
+    y_val = ytr[val_idx]
+    x_test = to_nchw_and_norm(xte, mean, std)
+    y_test = yte
 
-    x_train = to_nchw_and_norm(x_train_raw, mean, std)
-    x_val = to_nchw_and_norm(x_val_raw, mean, std)
-    x_test = to_nchw_and_norm(x_test_raw, mean, std)
-
-    # ResNet expects [N, C, H, W]
     x_train_t = torch.from_numpy(x_train)
-    x_val_t = torch.from_numpy(x_val)
-    x_test_t = torch.from_numpy(x_test)
     y_train_t = torch.from_numpy(y_train)
+    x_val_t = torch.from_numpy(x_val)
     y_val_t = torch.from_numpy(y_val)
+    x_test_t = torch.from_numpy(x_test)
     y_test_t = torch.from_numpy(y_test)
 
-    train_dataset = TensorDataset(x_train_t, y_train_t)
-    val_dataset = TensorDataset(x_val_t, y_val_t)
-    test_dataset = TensorDataset(x_test_t, y_test_t)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.bs,
-        shuffle=True,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.bs,
-        shuffle=True,
-        drop_last=True,
-    )
+    train_loader = DataLoader(TensorDataset(x_train_t, y_train_t), batch_size=args.bs, shuffle=True, drop_last=True)
+    val_loader = DataLoader(TensorDataset(x_val_t, y_val_t), batch_size=args.bs, shuffle=True, drop_last=True)
 
     def infinite_loader(loader):
-        """Yield batches from a DataLoader forever."""
         while True:
             for batch in loader:
                 yield batch
 
     val_iter = infinite_loader(val_loader)
 
-    val_eval_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
-    test_eval_loader = DataLoader(test_dataset, batch_size=512, shuffle=False)
+    val_eval_loader = DataLoader(TensorDataset(x_val_t, y_val_t), batch_size=512, shuffle=False)
+    test_eval_loader = DataLoader(TensorDataset(x_test_t, y_test_t), batch_size=512, shuffle=False)
 
-    # ---------------- models ----------------
+    # models
     net = build_model().to(device)
-    learner = LearnedL(L_min=args.Lmin, L_max=args.Lmax).to(device)
+    learner = LearnedL(L_min=args.Lmin, L_max=args.Lmax, hidden=32).to(device)
     theta_opt = torch.optim.Adam(learner.parameters(), lr=args.theta_lr)
     ce = nn.CrossEntropyLoss()
 
     params = list(net.parameters())
-    # EMA momentum buffers, same shape as params
     m_buffers = [torch.zeros_like(p, device=device) for p in params]
 
-    # ---------------- logs ----------------
+    # logs
     curve_logger = BatchLossLogger(
         run_dir,
-        meta={
-            "method": "learned_l_f2_cifar10_resnet18",
-            "seed": args.seed,
-            "opt": "learnedL",
-            "lr": args.theta_lr,
-        },
+        meta={"method": "learned_l_f2_cifar10_resnet18_online_pt", "seed": args.seed, "opt": "learnedL", "lr": args.theta_lr},
     )
     mech_path = run_dir / "mechanism_f2.csv"
+    eta_stats_path = run_dir / "eta_stats_f2.csv"
     train_log_path = run_dir / "train_log_f2.csv"
     time_log_path = run_dir / "time_log_f2.csv"
     result_path = run_dir / "result_f2.json"
 
     with open(mech_path, "w") as f:
         f.write("iter,epoch,eta_t,L_theta,phi_g,phi_m\n")
+    with open(eta_stats_path, "w") as f:
+        f.write("epoch,eta_mean,eta_std,eta_min,eta_max,eta_p50,eta_p90,eta_p99,L_mean,phi_g_mean,phi_m_mean,dot_mean\n")
     with open(train_log_path, "w") as f:
         f.write("epoch,elapsed_sec,train_loss,val_loss,test_loss,val_acc,test_acc\n")
     with open(time_log_path, "w") as f:
@@ -541,13 +388,18 @@ def main():
 
     global_step = 0
     start_time = time.time()
+    eta_prev = None
 
-    # ---------------- training loop (online meta-learning, F2) ----------------
+    # training loop
     for epoch in range(args.epochs):
         epoch_start = time.time()
         curve_logger.on_epoch_begin(epoch)
+
         train_loss_sum = 0.0
         train_batches = 0
+
+        # epoch stats
+        eta_hist, L_hist, phi_g_hist, phi_m_hist, dot_hist = [], [], [], [], []
 
         net.train()
         learner.train()
@@ -556,99 +408,74 @@ def main():
             xb = xb.to(device)
             yb = yb.to(device)
 
-            # --- 1) Train batch: compute g_t ---
             logits_tr = net(xb)
             train_loss = ce(logits_tr, yb)
             train_loss_sum += float(train_loss.item())
             train_batches += 1
 
-            grads = torch.autograd.grad(
-                train_loss,
-                params,
-                create_graph=False,
-                retain_graph=False,
-            )
-            grads = [
-                g if g is not None else torch.zeros_like(p)
-                for g, p in zip(grads, params)
-            ]
+            grads = torch.autograd.grad(train_loss, params, create_graph=False, retain_graph=False)
+            grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(grads, params)]
 
-            # --- 2) Update EMA of gradients: m_t = beta * m_{t-1} + (1 - beta) * g_t ---
+            # EMA update: m_t = beta m_{t-1} + (1-beta) g_t
             with torch.no_grad():
                 for i, (m, g) in enumerate(zip(m_buffers, grads)):
                     m_buffers[i] = args.beta * m + (1.0 - args.beta) * g
 
-            # --- 3) Compute F2 feature: phi_t = [log ||g_t||, log ||m_t||] ---
-            g_norm_sq = sum((g.detach() ** 2).sum() for g in grads)
-            g_norm = torch.sqrt(g_norm_sq + args.eps)
-
-            m_norm_sq = sum((m ** 2).sum() for m in m_buffers)
-            m_norm = torch.sqrt(m_norm_sq + args.eps)
-
+            # feature phi = [log||g||, log||m||]
+            g_norm = torch.sqrt(sum((g.detach() ** 2).sum() for g in grads) + args.eps)
+            m_norm = torch.sqrt(sum((m ** 2).sum() for m in m_buffers) + args.eps)
             phi_g = torch.log(g_norm + args.eps)
             phi_m = torch.log(m_norm + args.eps)
-            phi = torch.stack([phi_g, phi_m], dim=0).view(1, 2)  # [1, 2]
-
-            # --- 4) Val batch: compute val_loss and grad_val ---
-            xv, yv = next(val_iter)
-            xv = xv.to(device)
-            yv = yv.to(device)
-
-            logits_val = net(xv)
-            val_loss = ce(logits_val, yv)
-            grad_val = torch.autograd.grad(
-                val_loss,
-                params,
-                create_graph=False,
-                retain_graph=False,
-            )
-            grad_val = [
-                gv if gv is not None else torch.zeros_like(p)
-                for gv, p in zip(grad_val, params)
-            ]
-
-            # dot = sum <grad_val, m_t> (momentum direction, as in TF BF2)
-            dot = torch.zeros([], device=device, dtype=torch.float32)
-            for gv, m in zip(grad_val, m_buffers):
-                dot = dot + (gv.float() * m.float()).sum()
-
-            # --- 5) Online meta-update on theta using F2 feature ---
+            phi = torch.stack([phi_g, phi_m], dim=0).view(1, 2)
             phi_in = phi.to(device)
-            L_theta = learner(phi_in)  # [1, 1]
-            eta = args.c_base / (L_theta + args.eps)
 
+            # meta signal avg over K val batches
+            K = max(1, int(args.val_meta_batches))
+            dot_sum = torch.zeros([], device=device, dtype=torch.float32)
+            val_loss_sum = torch.zeros([], device=device, dtype=torch.float32)
+
+            for _ in range(K):
+                xv, yv = next(val_iter)
+                xv = xv.to(device)
+                yv = yv.to(device)
+
+                logits_val = net(xv)
+                val_loss_k = ce(logits_val, yv)
+                val_loss_sum = val_loss_sum + val_loss_k.detach()
+
+                grad_val = torch.autograd.grad(val_loss_k, params, create_graph=False, retain_graph=False)
+                grad_val = [gv if gv is not None else torch.zeros_like(p) for gv, p in zip(grad_val, params)]
+
+                # dot along momentum direction m_t
+                dot_k = torch.zeros([], device=device, dtype=torch.float32)
+                for gv, m in zip(grad_val, m_buffers):
+                    dot_k = dot_k + (gv.float() * m.float()).sum()
+                dot_sum = dot_sum + dot_k
+
+            dot = dot_sum / float(K)
+            val_loss = val_loss_sum / float(K)
+
+            # theta update
+            L_theta = learner(phi_in)
+            eta = args.c_base / (L_theta + args.eps)
             if global_step < args.warmup_steps:
-                # Warmup logic aligned with F1 implementations
-                warmup_max = min(
-                    args.eta_max,
-                    1.2 * args.c_base / (args.Lmin + args.eps),
-                )
+                warmup_max = min(args.eta_max, 1.2 * args.c_base / (args.Lmin + args.eps))
                 eta = torch.clamp(eta, min=args.eta_min, max=warmup_max)
             else:
                 eta = torch.clamp(eta, min=args.eta_min, max=args.eta_max)
+            eta_scalar = eta.squeeze()
 
-            eta_scalar = eta.squeeze()  # scalar tensor
-
-            # meta_loss = val_loss - eta * dot + small regularizer on L_theta
             meta_loss = val_loss.detach() - eta_scalar * dot.detach()
-            meta_loss = meta_loss + 1e-4 * torch.mean(
-                torch.square(torch.log(L_theta + args.eps))
-            )
+            meta_loss = meta_loss + 1e-4 * torch.mean(torch.square(torch.log(L_theta + args.eps)))
 
             theta_opt.zero_grad()
             meta_loss.backward()
             theta_opt.step()
 
-            # --- 6) Clip momentum and update w using the *updated* theta ---
-            # global norm for momentum (for clipping)
-            m_norm_for_clip = torch.sqrt(
-                sum((m ** 2).sum() for m in m_buffers) + 1e-12
-            )
+            # clip momentum and update w with updated theta + eta limiter + wd
+            m_norm_for_clip = torch.sqrt(sum((m ** 2).sum() for m in m_buffers) + 1e-12)
             if args.clip_grad is not None and args.clip_grad > 0.0:
-                if m_norm_for_clip.item() > args.clip_grad:
-                    clip_coef = args.clip_grad / float(m_norm_for_clip.item())
-                else:
-                    clip_coef = 1.0
+                clip_coef = args.clip_grad / float(m_norm_for_clip.item()) if m_norm_for_clip.item() > args.clip_grad else 1.0
             else:
                 clip_coef = 1.0
 
@@ -656,61 +483,56 @@ def main():
                 L_now = learner(phi_in)
                 eta_now = args.c_base / (L_now + args.eps)
                 if global_step < args.warmup_steps:
-                    warmup_max = min(
-                        args.eta_max,
-                        1.2 * args.c_base / (args.Lmin + args.eps),
-                    )
-                    eta_now = torch.clamp(
-                        eta_now, min=args.eta_min, max=warmup_max
-                    )
+                    warmup_max = min(args.eta_max, 1.2 * args.c_base / (args.Lmin + args.eps))
+                    eta_now = torch.clamp(eta_now, min=args.eta_min, max=warmup_max)
                 else:
-                    eta_now = torch.clamp(
-                        eta_now, min=args.eta_min, max=args.eta_max
-                    )
+                    eta_now = torch.clamp(eta_now, min=args.eta_min, max=args.eta_max)
                 eta_scalar_now = eta_now.squeeze()
 
-                for p, m in zip(params, m_buffers):
-                    m_update = m * clip_coef
-                    p.data -= eta_scalar_now.to(p.device).to(p.dtype) * m_update
+                # eta limiter
+                if eta_prev is None:
+                    eta_limited = eta_scalar_now
+                else:
+                    r = float(args.eta_change_ratio)
+                    if r > 0.0:
+                        lo = eta_prev * (1.0 - r)
+                        hi = eta_prev * (1.0 + r)
+                        eta_limited = torch.clamp(eta_scalar_now, min=lo, max=hi)
+                    else:
+                        eta_limited = eta_scalar_now
 
-                # Mechanism log
+                eta_limited = torch.clamp(eta_limited, min=args.eta_min, max=args.eta_max)
+                eta_prev = eta_limited.detach()
+
+                for p, m in zip(params, m_buffers):
+                    m_update = (m * clip_coef)
+                    if args.wd is not None and args.wd > 0.0:
+                        m_update = m_update + args.wd * p.data
+                    p.data -= eta_limited.to(p.device).to(p.dtype) * m_update
+
                 with open(mech_path, "a") as f:
                     f.write(
                         f"{global_step},{epoch},"
-                        f"{float(eta_scalar_now.item()):.6g},"
+                        f"{float(eta_limited.item()):.6g},"
                         f"{float(L_now.squeeze().item()):.6g},"
                         f"{float(phi_g.item()):.6g},"
                         f"{float(phi_m.item()):.6g}\n"
                     )
 
+            # stats
+            eta_hist.append(float(eta_limited.item()))
+            L_hist.append(float(L_now.squeeze().item()))
+            phi_g_hist.append(float(phi_g.item()))
+            phi_m_hist.append(float(phi_m.item()))
+            dot_hist.append(float(dot.detach().item()))
+
             curve_logger.on_train_batch_end(float(train_loss.item()))
             global_step += 1
 
-        # --- Epoch end evaluation (train loss, val/test loss + acc) ---
+        # epoch eval
         train_loss_epoch = train_loss_sum / max(train_batches, 1)
-
-        def eval_model(data_loader):
-            net.eval()
-            losses = []
-            correct = 0
-            total = 0
-            with torch.no_grad():
-                for xb_eval, yb_eval in data_loader:
-                    xb_eval = xb_eval.to(device)
-                    yb_eval = yb_eval.to(device)
-                    logits_eval = net(xb_eval)
-                    loss_eval = ce(logits_eval, yb_eval)
-                    losses.append(float(loss_eval.item()))
-                    preds = logits_eval.argmax(dim=1)
-                    correct += (preds == yb_eval).sum().item()
-                    total += yb_eval.size(0)
-            return (
-                np.mean(losses) if losses else float("nan"),
-                correct / max(total, 1),
-            )
-
-        val_loss_epoch, val_acc = eval_model(val_eval_loader)
-        test_loss_epoch, test_acc = eval_model(test_eval_loader)
+        val_loss_epoch, val_acc = evaluate_on_loader(net, device, val_eval_loader, ce)
+        test_loss_epoch, test_acc = evaluate_on_loader(net, device, test_eval_loader, ce)
 
         epoch_elapsed = time.time() - epoch_start
         total_elapsed = time.time() - start_time
@@ -727,15 +549,40 @@ def main():
         with open(time_log_path, "a") as f:
             f.write(f"{epoch},{epoch_elapsed:.3f},{total_elapsed:.3f}\n")
 
+        # eta stats
+        eta_arr = np.asarray(eta_hist, dtype=np.float64) if eta_hist else np.asarray([np.nan])
+        L_arr = np.asarray(L_hist, dtype=np.float64) if L_hist else np.asarray([np.nan])
+        pg_arr = np.asarray(phi_g_hist, dtype=np.float64) if phi_g_hist else np.asarray([np.nan])
+        pm_arr = np.asarray(phi_m_hist, dtype=np.float64) if phi_m_hist else np.asarray([np.nan])
+        dot_arr = np.asarray(dot_hist, dtype=np.float64) if dot_hist else np.asarray([np.nan])
+
+        eta_mean = float(np.nanmean(eta_arr))
+        eta_std = float(np.nanstd(eta_arr))
+        eta_minv = float(np.nanmin(eta_arr))
+        eta_maxv = float(np.nanmax(eta_arr))
+        eta_p50 = float(np.nanpercentile(eta_arr, 50))
+        eta_p90 = float(np.nanpercentile(eta_arr, 90))
+        eta_p99 = float(np.nanpercentile(eta_arr, 99))
+        L_mean = float(np.nanmean(L_arr))
+        pg_mean = float(np.nanmean(pg_arr))
+        pm_mean = float(np.nanmean(pm_arr))
+        dot_mean = float(np.nanmean(dot_arr))
+
+        with open(eta_stats_path, "a") as f:
+            f.write(
+                f"{epoch},{eta_mean:.8g},{eta_std:.8g},{eta_minv:.8g},{eta_maxv:.8g},"
+                f"{eta_p50:.8g},{eta_p90:.8g},{eta_p99:.8g},"
+                f"{L_mean:.8g},{pg_mean:.8g},{pm_mean:.8g},{dot_mean:.8g}\n"
+            )
+
         print(
             f"[CIFAR10-ResNet18-F2-PT EPOCH {epoch}] "
             f"time={epoch_elapsed:.2f}s total={total_elapsed/60:.2f}min "
-            f"train={train_loss_epoch:.4f} "
-            f"val={val_loss_epoch:.4f} test={test_loss_epoch:.4f} "
-            f"val_acc={val_acc:.4f} test_acc={test_acc:.4f}"
+            f"train={train_loss_epoch:.4f} val={val_loss_epoch:.4f} test={test_loss_epoch:.4f} "
+            f"val_acc={val_acc:.4f} test_acc={test_acc:.4f} "
+            f"eta_mean={eta_mean:.3g} eta_p99={eta_p99:.3g}"
         )
 
-        # WandB per-epoch logging
         if wandb_run is not None:
             wandb.log(
                 {
@@ -747,13 +594,20 @@ def main():
                     "test_acc": test_acc,
                     "time/epoch_sec": epoch_elapsed,
                     "time/total_sec": total_elapsed,
+                    "eta/mean": eta_mean,
+                    "eta/std": eta_std,
+                    "eta/min": eta_minv,
+                    "eta/max": eta_maxv,
+                    "eta/p90": eta_p90,
+                    "eta/p99": eta_p99,
+                    "meta/dot_mean": dot_mean,
                 }
             )
 
     curve_logger.on_train_end()
     total_time = time.time() - start_time
 
-    # ---------------- final eval on full test set ----------------
+    # final eval
     net.eval()
     with torch.no_grad():
         logits_test = net(x_test_t.to(device))
@@ -763,8 +617,7 @@ def main():
 
     print(
         f"[RESULT-CIFAR10-ResNet18-F2-PT] TestAcc={final_test_acc:.4f} "
-        f"TestLoss={final_test_loss:.4f} "
-        f"(Total time={total_time/60:.2f} min)"
+        f"TestLoss={final_test_loss:.4f} (Total time={total_time/60:.2f} min)"
     )
 
     result = {
@@ -791,20 +644,23 @@ def main():
             "theta_lr": args.theta_lr,
             "clip_grad": args.clip_grad,
             "beta": args.beta,
+            "val_meta_batches": args.val_meta_batches,
+            "eta_change_ratio": args.eta_change_ratio,
+            "wd": args.wd,
         },
     }
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
 
-    # WandB summary + upload logs
     if wandb_run is not None:
-        wandb_run.summary["final_test_acc"] = float(final_test_acc)
-        wandb_run.summary["final_test_loss"] = float(final_test_loss)
-        wandb_run.summary["total_time_sec"] = float(total_time)
+        wandb.run.summary["final_test_acc"] = float(final_test_acc)
+        wandb.run.summary["final_test_loss"] = float(final_test_loss)
+        wandb.run.summary["total_time_sec"] = float(total_time)
 
         for p in [
             curve_logger.curve_path,
             mech_path,
+            eta_stats_path,
             train_log_path,
             time_log_path,
             result_path,
