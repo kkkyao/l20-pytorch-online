@@ -7,17 +7,20 @@ MNIST-1D: Learning to Learn by Gradient Descent by Gradient Descent (L2L-GDGD)
 
 This version aligns closer to the reproduction notebook you pasted:
 
-Key changes vs your current file:
-  - REMOVE tanh bounding on optimizer output (notebook doesn't have tanh)
-  - Optimizee init scale default 1e-3 (notebook uses 1e-3 for MNIST matrices)
-  - Add MNIST1D per-position normalization via --preprocess_dir/norm.json (high impact)
-  - Keep "task = minibatch stream" distribution: fixed dataset by data_seed, task differs by shuffle order (task_seed)
+Key points:
+  - NO tanh bounding on optimizer output (notebook doesn't have tanh)
+  - Optimizee init scale default 1e-3 (notebook uses ~1e-3 for MNIST matrices)
+  - Optional MNIST1D per-position normalization via --preprocess_dir/seed_{data_seed}/norm.json
+  - TRUE task distribution: each task_seed defines a SUBSAMPLED dataset + its shuffle stream
+      * fixed base dataset by data_seed
+      * task differs by (subsample indices + shuffle order) controlled by task_seed
+  - Meta-gradient clipping: clip_grad_norm_ before meta_opt.step()
 
 Adds/keeps:
   - argparse
   - wandb optional
   - run_dir outputs
-  - per-meta-epoch evaluation of optimizee train/test loss+acc (like F1/F2/F3)
+  - per-meta-epoch evaluation of optimizee train/test loss+acc
 """
 
 import argparse
@@ -106,11 +109,15 @@ def apply_norm(x: np.ndarray, mean: np.ndarray, std: np.ndarray, eps: float = 1e
     return (x - mean[None, :]) / (std[None, :] + eps)
 
 
-# ---------------------- Task: minibatch stream (paper-style) ----------------------
+# ---------------------- Task: minibatch stream (task distribution) ----------------------
 class MNIST1DTask:
     """
-    A "task" is a minibatch stream over a fixed dataset, with its own shuffle order
+    A "task" is a minibatch stream over a (subsampled) dataset, with its own shuffle order
     controlled by task_seed.
+
+    IMPORTANT change vs your old code:
+      - Each task_seed can define a different SUBSET of the fixed dataset (subsample_frac < 1).
+      - This makes tasks meaningfully different (more like notebook's MNIST half-split idea).
     """
 
     def __init__(
@@ -119,11 +126,29 @@ class MNIST1DTask:
         y: np.ndarray,
         batch_size: int,
         task_seed: int,
-        drop_last: bool = True,
+        drop_last: bool = False,
+        subsample_frac: float = 1.0,
+        min_subsample: int = 256,
     ):
-        x_t = torch.from_numpy(np.asarray(x, dtype=np.float32))
-        y_t = torch.from_numpy(np.asarray(y, dtype=np.int64))
+        x = np.asarray(x, dtype=np.float32)
+        y = np.asarray(y, dtype=np.int64)
 
+        # Task-specific subsampling (true task distribution)
+        subsample_frac = float(subsample_frac)
+        if subsample_frac < 1.0:
+            rng = np.random.RandomState(int(task_seed))
+            n = x.shape[0]
+            m = int(n * subsample_frac)
+            m = max(min_subsample, m)
+            m = min(n, m)
+            idx = rng.choice(n, size=m, replace=False)
+            x = x[idx]
+            y = y[idx]
+
+        x_t = torch.from_numpy(x)
+        y_t = torch.from_numpy(y)
+
+        # Task-specific shuffle order
         gen = torch.Generator()
         gen.manual_seed(int(task_seed))
 
@@ -153,7 +178,7 @@ class MNIST1DOptimizee(nn.Module):
     NOTE:
       - Parameters stored in a plain dict are NOT auto-moved by .to(device).
       - So when params is None, we MUST create them on the correct device.
-      - init_scale default is 1e-3 to match the notebook MNIST net style (important for sigmoid).
+      - init_scale default is 1e-3 (important for sigmoid stability).
     """
 
     def __init__(
@@ -168,15 +193,14 @@ class MNIST1DOptimizee(nn.Module):
         self.init_scale = float(init_scale)
 
         if params is None:
-            self.params = {
+            p = {
                 "W1": torch.randn(40, hidden_dim, device=device) * self.init_scale,
                 "b1": torch.zeros(hidden_dim, device=device),
                 "W2": torch.randn(hidden_dim, 10, device=device) * self.init_scale,
                 "b2": torch.zeros(10, device=device),
             }
             # make them leaf tensors with grad
-            for k in list(self.params.keys()):
-                self.params[k] = detach_var(self.params[k])
+            self.params = {k: detach_var(v) for k, v in p.items()}
         else:
             self.params = params  # assume already on correct device and requires_grad
 
@@ -220,7 +244,7 @@ class LearnedOptimizer(nn.Module):
         self.out = nn.Linear(hidden_sz, 1)
 
     def _preprocess(self, g: torch.Tensor) -> torch.Tensor:
-        # Detach path like notebook: use .data to avoid gradient flow through gradient input.
+        # notebook-style: use .data so gradients won't flow "through gradients"
         gd = g.data
         out = torch.zeros(gd.size(0), 2, device=gd.device)
         keep = (gd.abs() >= self.preproc_threshold).squeeze()
@@ -231,7 +255,7 @@ class LearnedOptimizer(nn.Module):
         out[:, 0][~keep] = -1
         out[:, 1][~keep] = (math.exp(self.preproc_factor) * gd[~keep]).squeeze()
 
-        return out  # plain tensor is fine
+        return out
 
     def forward(
         self,
@@ -297,6 +321,7 @@ def run_inner_trajectory_get_final_params(
     batch_size: int,
     task_seed: int,
     init_scale: float,
+    task_subsample_frac: float,
 ) -> Dict[str, torch.Tensor]:
     """
     Run optimizee training for optim_steps using learned optimizer (no meta-grad),
@@ -305,7 +330,13 @@ def run_inner_trajectory_get_final_params(
     device = get_device()
     opt_net.eval()
 
-    task = MNIST1DTask(x_train, y_train, batch_size=batch_size, task_seed=task_seed, drop_last=True)
+    task = MNIST1DTask(
+        x_train, y_train,
+        batch_size=batch_size,
+        task_seed=task_seed,
+        drop_last=False,
+        subsample_frac=task_subsample_frac,
+    )
     optimizee = MNIST1DOptimizee(init_scale=init_scale)
     params = {k: v for k, v in optimizee.params.items()}  # on device already
 
@@ -349,8 +380,7 @@ def run_inner_trajectory_get_final_params(
                 new_cell[i][offset:offset + sz] = c_new[i].detach()
 
             new_p = (p + out_mul * update.view_as(p)).detach()
-            new_p = detach_var(new_p)
-            new_params[name] = new_p
+            new_params[name] = detach_var(new_p)
 
             offset += sz
 
@@ -374,6 +404,8 @@ def do_fit(
     training: bool = True,
     batch_size: int = 128,
     init_scale: float = 1e-3,
+    task_subsample_frac: float = 1.0,
+    meta_clip_norm: float = 1.0,
 ) -> List[float]:
     """
     One optimizee trajectory (one task seed). Returns per-step optimizee losses.
@@ -386,7 +418,13 @@ def do_fit(
         opt_net.eval()
         unroll = 1
 
-    task = MNIST1DTask(x, y, batch_size=batch_size, task_seed=task_seed, drop_last=True)
+    task = MNIST1DTask(
+        x, y,
+        batch_size=batch_size,
+        task_seed=task_seed,
+        drop_last=False,
+        subsample_frac=task_subsample_frac,
+    )
     optimizee = MNIST1DOptimizee(init_scale=init_scale)
 
     n_params = _count_params(optimizee)
@@ -439,6 +477,11 @@ def do_fit(
             if training and meta_opt is not None:
                 meta_opt.zero_grad(set_to_none=True)
                 total_loss.backward()
+
+                # ---- IMPORTANT: meta-gradient clipping for stability ----
+                if meta_clip_norm is not None and float(meta_clip_norm) > 0:
+                    torch.nn.utils.clip_grad_norm_(opt_net.parameters(), max_norm=float(meta_clip_norm))
+
                 meta_opt.step()
 
             optimizee = MNIST1DOptimizee(
@@ -464,7 +507,7 @@ def train_l2lgdgd(args, run_dir: Path):
     opt_net = LearnedOptimizer(hidden_sz=args.hidden_sz, preproc=(not args.no_preproc)).to(device)
     meta_opt = optim.Adam(opt_net.parameters(), lr=args.lr)
 
-    # FIXED dataset: tasks differ only by batch stream (shuffle order)
+    # FIXED base dataset by data_seed
     (xtr, ytr), (xte, yte) = load_mnist1d(length=40, seed=args.data_seed)
     xtr = _to_N40(xtr).astype(np.float32)
     xte = _to_N40(xte).astype(np.float32)
@@ -491,7 +534,7 @@ def train_l2lgdgd(args, run_dir: Path):
             "report_test_acc",
         ])
 
-    # helper: sample task seeds (controls shuffle order)
+    # helper: sample task seeds (controls subset + shuffle)
     rng = np.random.RandomState(args.seed)
 
     def sample_task_seed(low: int, high: int) -> int:
@@ -513,6 +556,8 @@ def train_l2lgdgd(args, run_dir: Path):
                 training=True,
                 batch_size=args.bs,
                 init_scale=args.init_scale,
+                task_subsample_frac=args.task_subsample_frac,
+                meta_clip_norm=args.meta_clip_norm,
             )
 
         # ---- meta-eval loss on held-out task seeds ----
@@ -531,6 +576,8 @@ def train_l2lgdgd(args, run_dir: Path):
                 training=False,
                 batch_size=args.bs,
                 init_scale=args.init_scale,
+                task_subsample_frac=args.task_subsample_frac,
+                meta_clip_norm=args.meta_clip_norm,
             )
             eval_losses.append(sum(traj))
         eval_meta_loss = float(np.mean(eval_losses))
@@ -550,11 +597,14 @@ def train_l2lgdgd(args, run_dir: Path):
                 batch_size=args.bs,
                 task_seed=task_seed,
                 init_scale=args.init_scale,
+                task_subsample_frac=args.task_subsample_frac,
             )
             tr_loss, tr_acc = eval_params_on_dataset(final_params, xtr, ytr, batch_size=512)
             te_loss, te_acc = eval_params_on_dataset(final_params, xte, yte, batch_size=512)
-            rep_train_losses.append(tr_loss); rep_train_accs.append(tr_acc)
-            rep_test_losses.append(te_loss); rep_test_accs.append(te_acc)
+            rep_train_losses.append(tr_loss)
+            rep_train_accs.append(tr_acc)
+            rep_test_losses.append(te_loss)
+            rep_test_accs.append(te_acc)
 
         report_train_loss = float(np.mean(rep_train_losses))
         report_train_acc = float(np.mean(rep_train_accs))
@@ -599,7 +649,7 @@ def train_l2lgdgd(args, run_dir: Path):
             torch.save(best_state, run_dir / "best_opt.pt")
 
     result = {
-        "method": "mnist1d_l2lgdgd_taskdist_stream_notebooklike",
+        "method": "mnist1d_l2lgdgd_taskdist_subsample_clip",
         "seed": int(args.seed),
         "data_seed": int(args.data_seed),
         "meta_epochs": int(args.meta_epochs),
@@ -615,6 +665,8 @@ def train_l2lgdgd(args, run_dir: Path):
         "hidden_sz": int(args.hidden_sz),
         "preproc": bool(not args.no_preproc),
         "preprocess_dir": (str(args.preprocess_dir) if args.preprocess_dir is not None else None),
+        "task_subsample_frac": float(args.task_subsample_frac),
+        "meta_clip_norm": float(args.meta_clip_norm),
         "train_seed_low": int(args.train_seed_low),
         "train_seed_high": int(args.train_seed_high),
         "eval_seed_low": int(args.eval_seed_low),
@@ -661,7 +713,21 @@ def build_argparser():
         help="If set, loads {preprocess_dir}/seed_{data_seed}/norm.json and normalizes x.",
     )
 
-    # task seed ranges (affect only minibatch order)
+    # TRUE task distribution knobs
+    ap.add_argument(
+        "--task_subsample_frac",
+        type=float,
+        default=0.5,
+        help="Each task_seed subsamples this fraction of the fixed train set to form a task dataset.",
+    )
+    ap.add_argument(
+        "--meta_clip_norm",
+        type=float,
+        default=1.0,
+        help="Clip grad norm of opt_net before meta_opt.step() at each unroll boundary. Set <=0 to disable.",
+    )
+
+    # task seed ranges (affect subset + shuffle)
     ap.add_argument("--train_seed_low", type=int, default=0)
     ap.add_argument("--train_seed_high", type=int, default=9999)
     ap.add_argument("--eval_seed_low", type=int, default=10000)
@@ -685,7 +751,8 @@ def main():
 
     run_name = (
         f"mnist1d_l2lgdgd_seed{args.seed}_data{args.data_seed}_"
-        f"streamTask_train{args.train_seed_low}-{args.train_seed_high}_"
+        f"sub{args.task_subsample_frac}_clip{args.meta_clip_norm}_"
+        f"train{args.train_seed_low}-{args.train_seed_high}_"
         f"eval{args.eval_seed_low}-{args.eval_seed_high}_"
         f"lr{args.lr}_init{args.init_scale}_"
         + datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -720,6 +787,8 @@ def main():
                 "hidden_sz": args.hidden_sz,
                 "preproc": (not args.no_preproc),
                 "preprocess_dir": args.preprocess_dir,
+                "task_subsample_frac": args.task_subsample_frac,
+                "meta_clip_norm": args.meta_clip_norm,
                 "train_seed_low": args.train_seed_low,
                 "train_seed_high": args.train_seed_high,
                 "eval_seed_low": args.eval_seed_low,
