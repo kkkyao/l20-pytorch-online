@@ -34,128 +34,102 @@ from data_mnist1d import load_mnist1d
 
 # ---------------------- Data utilities ----------------------
 def to_N40(x: np.ndarray, length: int = 40) -> np.ndarray:
-    """
-    Ensure input has shape [N, length], compatible with:
-      - [N, length]
-      - [N, length, 1]
-      - [N, 1, length]
-    """
     x = np.asarray(x)
     if x.ndim == 2 and x.shape[1] == length:
         return x
     if x.ndim == 3:
-        if x.shape[1] == length and x.shape[2] == 1:   # [N,40,1] -> [N,40]
+        if x.shape[1] == length and x.shape[2] == 1:
             return x[:, :, 0]
-        if x.shape[1] == 1 and x.shape[2] == length:   # [N,1,40] -> [N,40]
+        if x.shape[1] == 1 and x.shape[2] == length:
             return x[:, 0, :]
-    raise AssertionError(
-        f"Unexpected x shape: {x.shape}, expect [N,{length}] or [N,{length},1]/[N,1,{length}]"
-    )
+    raise AssertionError(f"Unexpected x shape: {x.shape}")
 
 
 def apply_norm_np(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    """Per-position standardization: (x - mean) / std, x: [N, 40]."""
     return (x - mean[None, :]) / std[None, :]
 
 
 def load_artifacts(preprocess_dir: Path, data_seed: int):
-    """
-    Load the same split and normalization statistics as F1/F2/F3:
-      - split.json: train_idx / val_idx
-      - norm.json:  mean / std
-    """
     pdir = preprocess_dir / f"seed_{data_seed}"
-    split_path = pdir / "split.json"
-    norm_path = pdir / "norm.json"
-    if not split_path.exists() or not norm_path.exists():
-        raise FileNotFoundError(f"Missing preprocess artifacts under: {pdir}")
-    with open(split_path, "r", encoding="utf-8") as f:
+    with open(pdir / "split.json", "r") as f:
         split = json.load(f)
-    with open(norm_path, "r", encoding="utf-8") as f:
+    with open(pdir / "norm.json", "r") as f:
         norm = json.load(f)
     return split, norm
 
 
 # ---------------------- Model ----------------------
 class Conv1DMNIST1D(nn.Module):
-    """
-    Conv1D backbone aligned with F1/F2/F3.
-
-    Input shape: [N, 1, 40]
-    """
-
     def __init__(self, input_len: int = 40):
         super().__init__()
-        # Conv1d uses [N, C, L]; here C = 1, L = input_len
-        self.conv1 = nn.Conv1d(in_channels=1, out_channels=32, kernel_size=5, padding=2)
+        self.conv1 = nn.Conv1d(1, 32, kernel_size=5, padding=2)
         self.relu = nn.ReLU(inplace=True)
-        self.pool = nn.MaxPool1d(kernel_size=2)
-        self.conv2 = nn.Conv1d(in_channels=32, out_channels=64, kernel_size=5, padding=2)
-        # Global average pooling over temporal dimension
-        self.gap = nn.AdaptiveAvgPool1d(output_size=1)
+        self.pool = nn.MaxPool1d(2)
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=5, padding=2)
+        self.gap = nn.AdaptiveAvgPool1d(1)
         self.fc1 = nn.Linear(64, 64)
         self.fc2 = nn.Linear(64, 10)
 
     def forward(self, x):
-        # x: [N, 1, 40]
         x = self.conv1(x)
         x = self.relu(x)
         x = self.pool(x)
         x = self.conv2(x)
         x = self.relu(x)
-        x = self.gap(x)               # [N, 64, 1]
-        x = x.view(x.size(0), -1)     # [N, 64]
+        x = self.gap(x)
+        x = x.view(x.size(0), -1)
         x = self.fc1(x)
         x = self.relu(x)
-        logits = self.fc2(x)          # [N, 10], logits (no softmax)
-        return logits
+        return self.fc2(x)
 
 
 # ---------------------- Logging helpers ----------------------
 class TimeLogger:
     """
-    Log wall-clock training time and epoch-level metrics to a CSV file.
-
-    Columns:
-      epoch, elapsed_sec, train_loss, val_loss, train_acc, val_acc
+    epoch, elapsed_sec,
+    train_loss, val_loss, train_acc, val_acc,
+    test_loss, test_acc
     """
 
     def __init__(self, out_csv: Path):
-        self.out_csv = Path(out_csv)
+        self.out_csv = out_csv
         self.start_time = None
 
     def on_train_begin(self):
         self.start_time = time.time()
 
-    def on_epoch_end(self, epoch, train_loss, val_loss, train_acc, val_acc):
-        if self.start_time is None:
-            raise RuntimeError("TimeLogger.on_train_begin must be called before training.")
+    def on_epoch_end(
+        self,
+        epoch,
+        train_loss,
+        val_loss,
+        train_acc,
+        val_acc,
+        test_loss,
+        test_acc,
+    ):
         elapsed = time.time() - self.start_time
         rec = {
-            "epoch": int(epoch + 1),
-            "elapsed_sec": float(elapsed),
-            "train_loss": float(train_loss),
-            "val_loss": float(val_loss),
-            "train_acc": float(train_acc),
-            "val_acc": float(val_acc),
+            "epoch": epoch + 1,
+            "elapsed_sec": elapsed,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_acc": train_acc,
+            "val_acc": val_acc,
+            "test_loss": test_loss,
+            "test_acc": test_acc,
         }
         write_header = not self.out_csv.exists()
         with open(self.out_csv, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rec.keys()))
+            writer = csv.DictWriter(f, fieldnames=rec.keys())
             if write_header:
                 writer.writeheader()
             writer.writerow(rec)
 
 
 class BatchLossLogger:
-    """
-    Log per-batch training loss: iter, epoch, loss
-    to a CSV file (for detailed training curves vs iterations).
-    """
-
     def __init__(self, csv_path: Path, flush_every: int = 200):
-        self.csv_path = Path(csv_path)
-        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self.csv_path = csv_path
         with open(self.csv_path, "w") as f:
             f.write("iter,epoch,loss\n")
         self.iter = 0
@@ -164,17 +138,16 @@ class BatchLossLogger:
         self.flush_every = flush_every
 
     def on_epoch_begin(self, epoch: int):
-        self.epoch = int(epoch)
+        self.epoch = epoch
 
     def on_train_batch_end(self, loss_value: float):
-        self.rows.append([self.iter, self.epoch, float(loss_value)])
+        self.rows.append([self.iter, self.epoch, loss_value])
         self.iter += 1
         if len(self.rows) >= self.flush_every:
             self._flush()
 
     def on_train_end(self):
-        if self.rows:
-            self._flush()
+        self._flush()
 
     def _flush(self):
         with open(self.csv_path, "a") as f:
@@ -185,216 +158,135 @@ class BatchLossLogger:
 
 class CSVLogger:
     """
-    Simple CSV logger roughly aligned with Keras CSVLogger.
-
-    Columns (per epoch):
-      epoch,accuracy,loss,val_accuracy,val_loss
+    epoch, accuracy, loss, val_accuracy, val_loss, test_accuracy, test_loss
     """
 
     def __init__(self, csv_path: Path):
-        self.csv_path = Path(csv_path)
-        self._initialized = False
+        self.csv_path = csv_path
+        self.initialized = False
 
-    def log_epoch(self, epoch, train_loss, val_loss, train_acc, val_acc):
+    def log_epoch(
+        self,
+        epoch,
+        train_loss,
+        val_loss,
+        train_acc,
+        val_acc,
+        test_loss,
+        test_acc,
+    ):
         rec = {
-            "epoch": int(epoch),
-            "accuracy": float(train_acc),
-            "loss": float(train_loss),
-            "val_accuracy": float(val_acc),
-            "val_loss": float(val_loss),
+            "epoch": epoch,
+            "accuracy": train_acc,
+            "loss": train_loss,
+            "val_accuracy": val_acc,
+            "val_loss": val_loss,
+            "test_accuracy": test_acc,
+            "test_loss": test_loss,
         }
-        write_header = not self._initialized and not self.csv_path.exists()
+        write_header = not self.initialized
         with open(self.csv_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rec.keys()))
+            writer = csv.DictWriter(f, fieldnames=rec.keys())
             if write_header:
                 writer.writeheader()
             writer.writerow(rec)
-        self._initialized = True
+        self.initialized = True
 
 
-# ---------------------- Training / evaluation helpers ----------------------
-def compute_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
-    """Compute classification accuracy given logits and integer labels."""
-    preds = logits.argmax(dim=1)
-    correct = (preds == targets).sum().item()
-    total = targets.numel()
-    return correct / total if total > 0 else 0.0
-
-
-def train_one_epoch(
-    model,
-    dataloader,
-    criterion,
-    optimizer,
-    device,
-    batch_logger: BatchLossLogger = None,
-):
+# ---------------------- Training helpers ----------------------
+def train_one_epoch(model, loader, criterion, optimizer, device, batch_logger=None):
     model.train()
-    running_loss = 0.0
-    running_correct = 0
-    running_total = 0
-
-    for batch_idx, (inputs, targets) in enumerate(dataloader):
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-
+    loss_sum, correct, total = 0.0, 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        logits = model(inputs)
-        loss = criterion(logits, targets)
+        logits = model(x)
+        loss = criterion(logits, y)
         loss.backward()
         optimizer.step()
 
-        batch_loss = loss.item()
-        if batch_logger is not None:
-            batch_logger.on_train_batch_end(batch_loss)
+        if batch_logger:
+            batch_logger.on_train_batch_end(loss.item())
 
-        running_loss += batch_loss * targets.size(0)
-        running_correct += (logits.argmax(dim=1) == targets).sum().item()
-        running_total += targets.size(0)
+        loss_sum += loss.item() * y.size(0)
+        correct += (logits.argmax(1) == y).sum().item()
+        total += y.size(0)
 
-    avg_loss = running_loss / running_total if running_total > 0 else float("nan")
-    acc = running_correct / running_total if running_total > 0 else 0.0
-    return avg_loss, acc
+    return loss_sum / total, correct / total
 
 
-def evaluate(model, dataloader, criterion, device):
+def evaluate(model, loader, criterion, device):
     model.eval()
-    running_loss = 0.0
-    running_correct = 0
-    running_total = 0
-
+    loss_sum, correct, total = 0.0, 0, 0
     with torch.no_grad():
-        for inputs, targets in dataloader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-
-            logits = model(inputs)
-            loss = criterion(logits, targets)
-
-            running_loss += loss.item() * targets.size(0)
-            running_correct += (logits.argmax(dim=1) == targets).sum().item()
-            running_total += targets.size(0)
-
-    avg_loss = running_loss / running_total if running_total > 0 else float("nan")
-    acc = running_correct / running_total if running_total > 0 else 0.0
-    return avg_loss, acc
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss_sum += loss.item() * y.size(0)
+            correct += (logits.argmax(1) == y).sum().item()
+            total += y.size(0)
+    return loss_sum / total, correct / total
 
 
 # ---------------------- Main ----------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--opt", type=str, default="sgd", choices=["sgd", "adam", "rmsprop"])
-    ap.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="training seed (model init, shuffling, etc.)",
-    )
-    ap.add_argument(
-        "--data_seed",
-        type=int,
-        default=42,
-        help="fixed data split seed (must match preprocess artifacts)",
-    )
+    ap.add_argument("--opt", choices=["sgd", "adam", "rmsprop"], default="sgd")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--data_seed", type=int, default=42)
     ap.add_argument("--epochs", type=int, default=140)
     ap.add_argument("--bs", type=int, default=128)
     ap.add_argument("--preprocess_dir", type=str, default="artifacts/preprocess")
-
-    # wandb-related arguments
-    ap.add_argument(
-        "--wandb",
-        action="store_true",
-        help="Enable logging to Weights & Biases.",
-    )
-    ap.add_argument(
-        "--wandb_project",
-        type=str,
-        default="mnist1d_conv1d_baselines",
-        help="W&B project name.",
-    )
-    ap.add_argument(
-        "--wandb_entity",
-        type=str,
-        default=None,
-        help="W&B entity/user name (optional).",
-    )
-    ap.add_argument(
-        "--wandb_group",
-        type=str,
-        default=None,
-        help="W&B group name (optional).",
-    )
-
+    ap.add_argument("--wandb", action="store_true")
+    ap.add_argument("--wandb_project", type=str, default="mnist1d_conv1d_baselines")
+    ap.add_argument("--wandb_entity", type=str, default=None)
+    ap.add_argument("--wandb_group", type=str, default=None)
     args = ap.parse_args()
 
-    # Set random seeds
     torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    np.random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}")
 
-    # ========== Data loading (aligned with F1/F2/F3) ==========
-    # 1) Load MNIST-1D using data_seed (only data_seed matters for the split)
     (xtr, ytr), (xte, yte) = load_mnist1d(length=40, seed=args.data_seed)
+    xtr = to_N40(xtr).astype(np.float32)
+    xte = to_N40(xte).astype(np.float32)
 
-    # 2) Normalize shape to [N, 40], convert dtypes
-    xtr = to_N40(xtr, length=40).astype(np.float32)
-    xte = to_N40(xte, length=40).astype(np.float32)
-    ytr = np.asarray(ytr, dtype=np.int64)
-    yte = np.asarray(yte, dtype=np.int64)
+    split, norm = load_artifacts(Path(args.preprocess_dir), args.data_seed)
+    mean, std = np.array(norm["mean"]), np.array(norm["std"])
 
-    # 3) Load fixed train/val split and normalization stats from preprocess artifacts
-    split, norm = load_artifacts(Path(args.preprocess_dir), data_seed=args.data_seed)
-    train_idx = np.array(split["train_idx"], dtype=np.int64)
-    val_idx = np.array(split["val_idx"], dtype=np.int64)
-    mean = np.array(norm["mean"], dtype=np.float32)
-    std = np.array(norm["std"], dtype=np.float32)
+    x_train = apply_norm_np(xtr[split["train_idx"]], mean, std)[..., None]
+    x_val = apply_norm_np(xtr[split["val_idx"]], mean, std)[..., None]
+    x_test = apply_norm_np(xte, mean, std)[..., None]
 
-    # 4) Build train/val/test sets and apply per-position normalization
-    x_train_raw, y_train = xtr[train_idx], ytr[train_idx]
-    x_val_raw, y_val = xtr[val_idx], ytr[val_idx]
-    x_test_raw, y_test = xte, yte
+    def to_tensor(x): return torch.from_numpy(x).permute(0, 2, 1)
 
-    x_train = apply_norm_np(x_train_raw, mean, std)[..., None]  # [N,40] -> [N,40,1]
-    x_val = apply_norm_np(x_val_raw, mean, std)[..., None]
-    x_test = apply_norm_np(x_test_raw, mean, std)[..., None]
+    train_loader = DataLoader(
+        TensorDataset(to_tensor(x_train), torch.from_numpy(ytr[split["train_idx"]])),
+        batch_size=args.bs, shuffle=True
+    )
+    val_loader = DataLoader(
+        TensorDataset(to_tensor(x_val), torch.from_numpy(ytr[split["val_idx"]])),
+        batch_size=args.bs
+    )
+    test_loader = DataLoader(
+        TensorDataset(to_tensor(x_test), torch.from_numpy(yte)),
+        batch_size=args.bs
+    )
 
-    # Convert to PyTorch tensors and permute to [N, 1, 40]
-    x_train_t = torch.from_numpy(x_train).permute(0, 2, 1)  # [N,40,1] -> [N,1,40]
-    x_val_t = torch.from_numpy(x_val).permute(0, 2, 1)
-    x_test_t = torch.from_numpy(x_test).permute(0, 2, 1)
-
-    y_train_t = torch.from_numpy(y_train)
-    y_val_t = torch.from_numpy(y_val)
-    y_test_t = torch.from_numpy(y_test)
-
-    train_dataset = TensorDataset(x_train_t, y_train_t)
-    val_dataset = TensorDataset(x_val_t, y_val_t)
-    test_dataset = TensorDataset(x_test_t, y_test_t)
-
-    train_loader = DataLoader(train_dataset, batch_size=args.bs, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.bs, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=args.bs, shuffle=False)
-
-    # ========== Model construction ==========
-    model = Conv1DMNIST1D(input_len=40).to(device)
-
-    # Optimizer choice (simple fixed learning rates)
+    model = Conv1DMNIST1D().to(device)
     if args.opt == "sgd":
-        optimizer = optim.SGD(model.parameters(), lr=0.10, momentum=0.0)
+        optimizer = optim.SGD(model.parameters(), lr=0.1)
     elif args.opt == "adam":
         optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    elif args.opt == "rmsprop":
-        optimizer = optim.RMSprop(model.parameters(), lr=1e-3)
     else:
-        raise ValueError(f"Unsupported optimizer: {args.opt}")
+        optimizer = optim.RMSprop(model.parameters(), lr=1e-3)
 
     criterion = nn.CrossEntropyLoss()
 
-    # ========== Logging directory & loggers ==========
     run_dir = Path("runs") / f"baseline_conv1d_{args.opt}_seed{args.seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -402,150 +294,67 @@ def main():
     batch_logger = BatchLossLogger(run_dir / "curve.csv")
     csv_logger = CSVLogger(run_dir / "train_log.csv")
 
-    # ========== Optional: Weights & Biases logging ==========
     wandb_run = None
     if args.wandb:
-        try:
-            import wandb
-        except ImportError as e:
-            raise ImportError(
-                "wandb is not installed. Please `pip install wandb` or "
-                "run without the --wandb flag."
-            ) from e
-
-        run_name = (
-            f"baseline_conv1d_{args.opt}_seed{args.seed}_data{args.data_seed}"
-        )
-
-        wandb_config = {
-            "method": "baseline_conv1d",
-            "optimizer": args.opt,
-            "seed": int(args.seed),
-            "data_seed": int(args.data_seed),
-            "epochs": int(args.epochs),
-            "batch_size": int(args.bs),
-            "preprocess_dir": str(args.preprocess_dir),
-            "device": str(device),
-        }
-
+        import wandb
         wandb_run = wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
             group=args.wandb_group,
-            name=run_name,
-            config=wandb_config,
+            name=f"baseline_{args.opt}_seed{args.seed}",
         )
 
-    # ========== Training ==========
     time_logger.on_train_begin()
-    train_start_time = time.time()
 
     for epoch in range(args.epochs):
-        print(f"Epoch {epoch + 1}/{args.epochs}")
-
         batch_logger.on_epoch_begin(epoch)
 
         train_loss, train_acc = train_one_epoch(
-            model=model,
-            dataloader=train_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            device=device,
-            batch_logger=batch_logger,
+            model, train_loader, criterion, optimizer, device, batch_logger
         )
-
-        val_loss, val_acc = evaluate(
-            model=model,
-            dataloader=val_loader,
-            criterion=criterion,
-            device=device,
-        )
+        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
 
         time_logger.on_epoch_end(
-            epoch=epoch,
-            train_loss=train_loss,
-            val_loss=val_loss,
-            train_acc=train_acc,
-            val_acc=val_acc,
+            epoch,
+            train_loss, val_loss, train_acc, val_acc,
+            test_loss, test_acc,
         )
-
         csv_logger.log_epoch(
-            epoch=epoch,
-            train_loss=train_loss,
-            val_loss=val_loss,
-            train_acc=train_acc,
-            val_acc=val_acc,
+            epoch,
+            train_loss, val_loss, train_acc, val_acc,
+            test_loss, test_acc,
         )
 
-        print(
-            f"  train_loss={train_loss:.4f}, train_acc={train_acc:.4f}, "
-            f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}"
-        )
-
-        if wandb_run is not None:
+        if wandb_run:
             import wandb
-
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "train_loss": float(train_loss),
-                    "train_acc": float(train_acc),
-                    "val_loss": float(val_loss),
-                    "val_acc": float(val_acc),
-                }
-            )
+            wandb.log({
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "test_loss": test_loss,
+                "test_acc": test_acc,
+            })
 
     batch_logger.on_train_end()
-    total_train_time = time.time() - train_start_time
 
-    # ========== Test ==========
-    test_loss, test_acc = evaluate(
-        model=model,
-        dataloader=test_loader,
-        criterion=criterion,
-        device=device,
-    )
+    # -------- final test (unchanged semantics) --------
+    final_test_loss, final_test_acc = evaluate(model, test_loader, criterion, device)
 
-    print(
-        f"[BASELINE] opt={args.opt} seed={args.seed} data_seed={args.data_seed} "
-        f"TestAcc={test_acc:.4f}, TestLoss={test_loss:.4f}"
-    )
-    print(f"[LOG] Time log saved to: {time_logger.out_csv.resolve()}")
+    with open(run_dir / "result.json", "w") as f:
+        json.dump({
+            "test_loss": final_test_loss,
+            "test_acc": final_test_acc,
+        }, f, indent=2)
 
-    # ========== Save result to local JSON ==========
-    result = {
-        "method": f"baseline_conv1d_{args.opt}",
-        "seed": int(args.seed),
-        "data_seed": int(args.data_seed),
-        "epochs": int(args.epochs),
-        "bs": int(args.bs),
-        "test_acc": float(test_acc),
-        "test_loss": float(test_loss),
-        "train_elapsed_sec": float(total_train_time),
-        "run_dir": str(run_dir),
-    }
-    with open(run_dir / "result.json", "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
-
-    # ========== Also log results to wandb (if enabled) ==========
-    if wandb_run is not None:
+    if wandb_run:
         import wandb
-
-        wandb.log(
-            {
-                "test_loss": float(test_loss),
-                "test_acc": float(test_acc),
-                "train_elapsed_sec": float(total_train_time),
-            }
-        )
-        try:
-            wandb.save(str(run_dir / "time_log.csv"))
-            wandb.save(str(run_dir / "curve.csv"))
-            wandb.save(str(run_dir / "train_log.csv"))
-            wandb.save(str(run_dir / "result.json"))
-        except Exception as e:
-            print(f"[W&B] Warning: failed to save local log files to wandb: {e}")
-
+        wandb.log({
+            "final_test_loss": final_test_loss,
+            "final_test_acc": final_test_acc,
+        })
         wandb.finish()
 
 

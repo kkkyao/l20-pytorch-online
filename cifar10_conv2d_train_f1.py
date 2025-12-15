@@ -16,12 +16,18 @@ Step-size:
 Online meta-learning loop (single task):
   For each train batch:
     1) Compute train loss and gradient g_t on train batch
-    2) Sample a val batch, compute val_loss and grad_val
-    3) Compute dot = <grad_val, g_t>
+    2) Sample K val batches, compute val_loss and grad_val
+    3) Compute dot = <grad_val, g_t> (averaged over K to reduce noise)
     4) Define meta_loss = val_loss - eta * dot + small regularizer
     5) Take one gradient step on theta (parameters of LearnedL)
     6) With the updated LearnedL, recompute eta and update w
        using a plain SGD-like step (no momentum) with global-norm clipping
+
+Stability additions (minimal invasive):
+  - Average meta dot over multiple val batches (--val_meta_batches)
+  - Limit per-step eta relative change (--eta_change_ratio)
+  - Optional weight decay in the manual SGD update (--wd)
+  - Per-epoch eta/L/phi/dot statistics logged to eta_stats_f1.csv
 
 There is NO separate meta-train / meta-test split in this script:
   - Conv2D backbone (w) and LearnedL (theta) are trained jointly online
@@ -37,6 +43,7 @@ Outputs:
   run_dir = runs/<run_name> with:
     - curve_f1.csv           (per-batch train loss)
     - mechanism_f1.csv       (eta_t, L_theta, phi_t per step)
+    - eta_stats_f1.csv       (per-epoch eta stats)
     - train_log_f1.csv       (per-epoch train/val/test loss+acc)
     - time_log_f1.csv        (per-epoch timing)
     - result_f1.json         (final summary)
@@ -45,7 +52,6 @@ Outputs:
 
 import argparse
 import json
-import math
 import time
 from datetime import datetime
 from pathlib import Path
@@ -304,10 +310,8 @@ def evaluate_on_loader(model, device, loader, criterion):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seed", type=int, default=0,
-                    help="training seed")
-    ap.add_argument("--data_seed", type=int, default=42,
-                    help="data split / preprocess seed")
+    ap.add_argument("--seed", type=int, default=0, help="training seed")
+    ap.add_argument("--data_seed", type=int, default=42, help="data split / preprocess seed")
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--bs", type=int, default=128)
     ap.add_argument(
@@ -328,30 +332,19 @@ def main():
     ap.add_argument("--theta_lr", type=float, default=1e-3)
     ap.add_argument("--clip_grad", type=float, default=1.0)
 
+    # --- Stability / regularization knobs ---
+    ap.add_argument("--val_meta_batches", type=int, default=2,
+                    help="number of val mini-batches to average for meta dot (reduces noise)")
+    ap.add_argument("--eta_change_ratio", type=float, default=0.05,
+                    help="max relative change of eta per step, e.g. 0.05 means +/-5%")
+    ap.add_argument("--wd", type=float, default=0.0,
+                    help="weight decay applied in the manual w update (0 disables)")
+
     # WandB logging
-    ap.add_argument(
-        "--wandb",
-        action="store_true",
-        help="enable Weights & Biases logging",
-    )
-    ap.add_argument(
-        "--wandb_project",
-        type=str,
-        default="l2o-cifar10",
-        help="WandB project name",
-    )
-    ap.add_argument(
-        "--wandb_group",
-        type=str,
-        default="cifar10_conv2d_f1_bf1pt",
-        help="WandB group name",
-    )
-    ap.add_argument(
-        "--wandb_run_name",
-        type=str,
-        default=None,
-        help="optional WandB run name, defaults to run_name",
-    )
+    ap.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
+    ap.add_argument("--wandb_project", type=str, default="l2o-cifar10", help="WandB project name")
+    ap.add_argument("--wandb_group", type=str, default="cifar10_conv2d_f1_bf1pt", help="WandB group name")
+    ap.add_argument("--wandb_run_name", type=str, default=None, help="optional WandB run name, defaults to run_name")
 
     args = ap.parse_args()
 
@@ -398,6 +391,9 @@ def main():
             "eta_max": args.eta_max,
             "theta_lr": args.theta_lr,
             "clip_grad": args.clip_grad,
+            "val_meta_batches": args.val_meta_batches,
+            "eta_change_ratio": args.eta_change_ratio,
+            "wd": args.wd,
         }
         wandb_run = wandb.init(
             project=args.wandb_project,
@@ -442,18 +438,8 @@ def main():
     val_dataset = TensorDataset(x_val_t, y_val_t)
     test_dataset = TensorDataset(x_test_t, y_test_t)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.bs,
-        shuffle=True,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.bs,
-        shuffle=True,
-        drop_last=True,
-    )
+    train_loader = DataLoader(train_dataset, batch_size=args.bs, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.bs, shuffle=True, drop_last=True)
 
     def infinite_loader(loader):
         """Yield batches from a DataLoader forever."""
@@ -489,12 +475,16 @@ def main():
         },
     )
     mech_path = run_dir / "mechanism_f1.csv"
+    eta_stats_path = run_dir / "eta_stats_f1.csv"
     train_log_path = run_dir / "train_log_f1.csv"
     time_log_path = run_dir / "time_log_f1.csv"
     result_path = run_dir / "result_f1.json"
 
     with open(mech_path, "w") as f:
         f.write("iter,epoch,eta_t,L_theta,phi_t\n")
+    with open(eta_stats_path, "w") as f:
+        f.write("epoch,eta_mean,eta_std,eta_min,eta_max,eta_p50,eta_p90,eta_p99,"
+                "L_mean,phi_mean,dot_mean\n")
     with open(train_log_path, "w") as f:
         f.write("epoch,elapsed_sec,train_loss,val_loss,test_loss,val_acc,test_acc\n")
     with open(time_log_path, "w") as f:
@@ -502,6 +492,7 @@ def main():
 
     global_step = 0
     start_time = time.time()
+    eta_prev = None  # for per-step eta change limiting
 
     # ------------------------------------------------------------------
     # Training loop (online meta-learning BF1-style)
@@ -511,6 +502,12 @@ def main():
         curve_logger.on_epoch_begin(epoch)
         train_loss_sum = 0.0
         train_batches = 0
+
+        # epoch stats
+        eta_hist = []
+        L_hist = []
+        phi_hist = []
+        dot_hist = []
 
         net.train()
         learner.train()
@@ -540,32 +537,43 @@ def main():
             g_norm_sq = sum((g.detach() ** 2).sum() for g in grads)
             g_norm = torch.sqrt(g_norm_sq + args.eps)
             phi = torch.log(g_norm + args.eps).view(1, 1)  # [1,1]
+            phi_in = phi.to(device)
 
-            # 2) val batch: val_loss and grad_val
-            xv, yv = next(val_iter)
-            xv = xv.to(device)
-            yv = yv.to(device)
+            # 2) meta signal: average over K val batches to reduce noise
+            K = max(1, int(args.val_meta_batches))
+            dot_sum = torch.zeros([], device=device, dtype=torch.float32)
+            val_loss_sum = torch.zeros([], device=device, dtype=torch.float32)
 
-            logits_val = net(xv)
-            val_loss = ce(logits_val, yv)
-            grad_val = torch.autograd.grad(
-                val_loss,
-                params,
-                create_graph=False,
-                retain_graph=False,
-            )
-            grad_val = [
-                gv if gv is not None else torch.zeros_like(p)
-                for gv, p in zip(grad_val, params)
-            ]
+            for _ in range(K):
+                xv, yv = next(val_iter)
+                xv = xv.to(device)
+                yv = yv.to(device)
 
-            # dot = sum <grad_val, g_t>
-            dot = torch.zeros([], device=device, dtype=torch.float32)
-            for gv, g in zip(grad_val, grads):
-                dot = dot + (gv.float() * g.detach().float()).sum()
+                logits_val = net(xv)
+                val_loss_k = ce(logits_val, yv)
+                val_loss_sum = val_loss_sum + val_loss_k.detach()
+
+                grad_val = torch.autograd.grad(
+                    val_loss_k,
+                    params,
+                    create_graph=False,
+                    retain_graph=False,
+                )
+                grad_val = [
+                    gv if gv is not None else torch.zeros_like(p)
+                    for gv, p in zip(grad_val, params)
+                ]
+
+                dot_k = torch.zeros([], device=device, dtype=torch.float32)
+                for gv, g in zip(grad_val, grads):
+                    dot_k = dot_k + (gv.float() * g.detach().float()).sum()
+
+                dot_sum = dot_sum + dot_k
+
+            dot = dot_sum / float(K)
+            val_loss = val_loss_sum / float(K)
 
             # 3) Online meta-update on theta
-            phi_in = phi.to(device)
             L_theta = learner(phi_in)  # [1,1]
             eta = args.c_base / (L_theta + args.eps)
 
@@ -605,32 +613,53 @@ def main():
             with torch.no_grad():
                 L_now = learner(phi_in)
                 eta_now = args.c_base / (L_now + args.eps)
+
                 if global_step < args.warmup_steps:
                     warmup_max = min(
                         args.eta_max,
                         1.2 * args.c_base / (args.Lmin + args.eps),
                     )
-                    eta_now = torch.clamp(
-                        eta_now, min=args.eta_min, max=warmup_max
-                    )
+                    eta_now = torch.clamp(eta_now, min=args.eta_min, max=warmup_max)
                 else:
-                    eta_now = torch.clamp(
-                        eta_now, min=args.eta_min, max=args.eta_max
-                    )
+                    eta_now = torch.clamp(eta_now, min=args.eta_min, max=args.eta_max)
+
                 eta_scalar_now = eta_now.squeeze()
+
+                # --- per-step eta change limiter ---
+                if eta_prev is None:
+                    eta_limited = eta_scalar_now
+                else:
+                    r = float(args.eta_change_ratio)
+                    if r is not None and r > 0.0:
+                        lo = eta_prev * (1.0 - r)
+                        hi = eta_prev * (1.0 + r)
+                        eta_limited = torch.clamp(eta_scalar_now, min=lo, max=hi)
+                    else:
+                        eta_limited = eta_scalar_now
+
+                eta_limited = torch.clamp(eta_limited, min=args.eta_min, max=args.eta_max)
+                eta_prev = eta_limited.detach()
 
                 for p, g in zip(params, grads):
                     g_update = g * clip_coef
-                    p.data -= eta_scalar_now.to(p.device).to(p.dtype) * g_update
+                    if args.wd is not None and args.wd > 0.0:
+                        g_update = g_update + args.wd * p.data
+                    p.data -= eta_limited.to(p.device).to(p.dtype) * g_update
 
                 # mechanism log
                 with open(mech_path, "a") as f:
                     f.write(
                         f"{global_step},{epoch},"
-                        f"{float(eta_scalar_now.item()):.6g},"
+                        f"{float(eta_limited.item()):.6g},"
                         f"{float(L_now.squeeze().item()):.6g},"
                         f"{float(phi.squeeze().item()):.6g}\n"
                     )
+
+            # per-step stats
+            eta_hist.append(float(eta_limited.item()))
+            L_hist.append(float(L_now.squeeze().item()))
+            phi_hist.append(float(phi.squeeze().item()))
+            dot_hist.append(float(dot.detach().item()))
 
             curve_logger.on_train_batch_end(float(train_loss.item()))
             global_step += 1
@@ -639,12 +668,8 @@ def main():
         # Epoch-level evaluation
         # ------------------------------------------------------------------
         train_loss_epoch = train_loss_sum / max(train_batches, 1)
-        val_loss_epoch, val_acc = evaluate_on_loader(
-            net, device, val_eval_loader, ce
-        )
-        test_loss_epoch, test_acc = evaluate_on_loader(
-            net, device, test_eval_loader, ce
-        )
+        val_loss_epoch, val_acc = evaluate_on_loader(net, device, val_eval_loader, ce)
+        test_loss_epoch, test_acc = evaluate_on_loader(net, device, test_eval_loader, ce)
 
         epoch_elapsed = time.time() - epoch_start
         total_elapsed = time.time() - start_time
@@ -661,12 +686,37 @@ def main():
         with open(time_log_path, "a") as f:
             f.write(f"{epoch},{epoch_elapsed:.3f},{total_elapsed:.3f}\n")
 
+        # --- epoch-level eta statistics ---
+        eta_arr = np.asarray(eta_hist, dtype=np.float64) if eta_hist else np.asarray([np.nan])
+        L_arr = np.asarray(L_hist, dtype=np.float64) if L_hist else np.asarray([np.nan])
+        phi_arr = np.asarray(phi_hist, dtype=np.float64) if phi_hist else np.asarray([np.nan])
+        dot_arr = np.asarray(dot_hist, dtype=np.float64) if dot_hist else np.asarray([np.nan])
+
+        eta_mean = float(np.nanmean(eta_arr))
+        eta_std = float(np.nanstd(eta_arr))
+        eta_minv = float(np.nanmin(eta_arr))
+        eta_maxv = float(np.nanmax(eta_arr))
+        eta_p50 = float(np.nanpercentile(eta_arr, 50))
+        eta_p90 = float(np.nanpercentile(eta_arr, 90))
+        eta_p99 = float(np.nanpercentile(eta_arr, 99))
+        L_mean = float(np.nanmean(L_arr))
+        phi_mean = float(np.nanmean(phi_arr))
+        dot_mean = float(np.nanmean(dot_arr))
+
+        with open(eta_stats_path, "a") as f:
+            f.write(
+                f"{epoch},{eta_mean:.8g},{eta_std:.8g},{eta_minv:.8g},{eta_maxv:.8g},"
+                f"{eta_p50:.8g},{eta_p90:.8g},{eta_p99:.8g},"
+                f"{L_mean:.8g},{phi_mean:.8g},{dot_mean:.8g}\n"
+            )
+
         print(
             f"[CIFAR10-Conv2D-F1-PT EPOCH {epoch}] "
             f"time={epoch_elapsed:.2f}s total={total_elapsed/60:.2f}min "
             f"train={train_loss_epoch:.4f} "
             f"val={val_loss_epoch:.4f} test={test_loss_epoch:.4f} "
-            f"val_acc={val_acc:.4f} test_acc={test_acc:.4f}"
+            f"val_acc={val_acc:.4f} test_acc={test_acc:.4f} "
+            f"eta_mean={eta_mean:.3g} eta_p99={eta_p99:.3g}"
         )
 
         # WandB logging per epoch
@@ -681,6 +731,13 @@ def main():
                     "test_acc": test_acc,
                     "time/epoch_sec": epoch_elapsed,
                     "time/total_sec": total_elapsed,
+                    "eta/mean": eta_mean,
+                    "eta/std": eta_std,
+                    "eta/min": eta_minv,
+                    "eta/max": eta_maxv,
+                    "eta/p90": eta_p90,
+                    "eta/p99": eta_p99,
+                    "meta/dot_mean": dot_mean,
                 }
             )
 
@@ -695,9 +752,7 @@ def main():
         logits_test = net(x_test_t.to(device))
         final_test_loss = ce(logits_test, y_test_t.to(device)).item()
         preds_test = logits_test.argmax(dim=1)
-        final_test_acc = (
-            (preds_test == y_test_t.to(device)).float().mean().item()
-        )
+        final_test_acc = (preds_test == y_test_t.to(device)).float().mean().item()
 
     print(
         f"[RESULT-CIFAR10-Conv2D-F1-PT] "
@@ -728,6 +783,9 @@ def main():
             "eta_max": args.eta_max,
             "theta_lr": args.theta_lr,
             "clip_grad": args.clip_grad,
+            "val_meta_batches": args.val_meta_batches,
+            "eta_change_ratio": args.eta_change_ratio,
+            "wd": args.wd,
         },
     }
     with open(result_path, "w", encoding="utf-8") as f:
@@ -742,6 +800,7 @@ def main():
         for p in [
             curve_logger.curve_path,
             mech_path,
+            eta_stats_path,
             train_log_path,
             time_log_path,
             result_path,
