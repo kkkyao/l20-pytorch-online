@@ -4,11 +4,18 @@
 """
 MNIST-1D: Learning to Learn by Gradient Descent by Gradient Descent (L2L-GDGD)
 
-Adds:
+Task-distribution version (IMPORTANT FIX):
+- Each do_fit() samples a new task by using a different data_seed to generate MNIST-1D.
+- Meta-train tasks and meta-eval/report tasks use disjoint seed ranges.
+- Per meta-epoch:
+    - eval_meta_loss: average sum(loss_t) over eval tasks
+    - report train/test loss+acc: average over report tasks after running inner trajectory
+
+Keeps:
 - argparse
 - wandb (optional)
 - run_dir outputs
-- per-meta-epoch evaluation of optimizee train/test loss+acc (like your F1/F2/F3 scripts)
+- per-meta-epoch reporting similar to your F1/F2/F3 scripts
 """
 
 import argparse
@@ -68,7 +75,7 @@ class MNIST1DLoss:
     """
 
     def __init__(self, training: bool = True, batch_size: int = 128, data_seed: int = 42):
-        (xtr, ytr), (xte, yte) = load_mnist1d(length=40, seed=data_seed)
+        (xtr, ytr), (xte, yte) = load_mnist1d(length=40, seed=int(data_seed))
         if training:
             x, y = xtr, ytr
         else:
@@ -221,21 +228,30 @@ def eval_params_on_dataset(
     return total_loss / max(total, 1), total_correct / max(total, 1)
 
 
+def sample_task_seed(rng: np.random.RandomState, low: int, high: int) -> int:
+    """
+    Sample an integer seed in [low, high], inclusive.
+    """
+    if high < low:
+        raise ValueError(f"Invalid seed range: low={low} high={high}")
+    return int(rng.randint(low, high + 1))
+
+
 def run_inner_trajectory_get_final_params(
     opt_net: LearnedOptimizer,
     optim_steps: int,
     out_mul: float,
     batch_size: int,
-    data_seed: int,
+    task_seed: int,
 ) -> Dict[str, torch.Tensor]:
     """
     Run optimizee training for optim_steps using learned optimizer (no meta-grad),
-    return final params dict. This is used for reporting train/test loss+acc per meta-epoch.
+    return final params dict. Used for reporting train/test loss+acc per meta-epoch.
     """
     device = get_device()
     opt_net.eval()
 
-    loss_obj = MNIST1DLoss(training=True, batch_size=batch_size, data_seed=data_seed)
+    loss_obj = MNIST1DLoss(training=True, batch_size=batch_size, data_seed=task_seed)
     optimizee = MNIST1DOptimizee()
     params = {k: v for k, v in optimizee.params.items()}  # on device already
 
@@ -248,7 +264,6 @@ def run_inner_trajectory_get_final_params(
         x = x.to(device)
         y = y.to(device)
 
-        # compute loss + grads w.r.t current params
         logits = forward_logits_with_params(x, params)
         loss = F.cross_entropy(logits, y)
 
@@ -260,7 +275,6 @@ def run_inner_trajectory_get_final_params(
             allow_unused=False,
         )
 
-        # apply coordinate-wise LSTM update
         offset = 0
         new_params: Dict[str, torch.Tensor] = {}
         new_hidden = [torch.zeros_like(h) for h in hidden]
@@ -302,10 +316,11 @@ def do_fit(
     out_mul: float = 0.1,
     training: bool = True,
     batch_size: int = 128,
-    data_seed: int = 42,
+    task_seed: int = 42,
 ) -> List[float]:
     """
-    One optimizee trajectory. Returns per-step optimizee losses.
+    One optimizee trajectory on one task (task_seed).
+    Returns per-step optimizee losses.
     """
     device = get_device()
     if training:
@@ -314,7 +329,7 @@ def do_fit(
         opt_net.eval()
         unroll = 1
 
-    loss_obj = MNIST1DLoss(training=training, batch_size=batch_size, data_seed=data_seed)
+    loss_obj = MNIST1DLoss(training=training, batch_size=batch_size, data_seed=task_seed)
     optimizee = MNIST1DOptimizee()  # params already on device
 
     n_params = _count_params(optimizee)
@@ -381,16 +396,16 @@ def train_l2lgdgd(args, run_dir: Path):
     device = get_device()
     set_seed(args.seed)
 
+    # RNG for sampling task seeds (reproducible)
+    rng = np.random.RandomState(args.seed)
+
     opt_net = LearnedOptimizer().to(device)
     meta_opt = optim.Adam(opt_net.parameters(), lr=args.lr)
-
-    # load full datasets for reporting train/test metrics
-    (xtr, ytr), (xte, yte) = load_mnist1d(length=40, seed=args.data_seed)
 
     best_eval_meta_loss = float("inf")
     best_state = None
 
-    # CSV log like your other scripts
+    # CSV log
     train_log_path = run_dir / "train_log.csv"
     with open(train_log_path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -398,15 +413,16 @@ def train_l2lgdgd(args, run_dir: Path):
             "meta_epoch",
             "elapsed_sec",
             "eval_meta_loss",
-            "train_loss",
-            "train_acc",
-            "test_loss",
-            "test_acc",
+            "report_train_loss",
+            "report_train_acc",
+            "report_test_loss",
+            "report_test_acc",
         ])
 
     for ep in range(args.meta_epochs):
-        # meta-train
+        # ---------------- meta-train: sample fresh task_seed each inner loop ----------------
         for _ in range(args.inner_loops_per_epoch):
+            task_seed = sample_task_seed(rng, args.train_seed_low, args.train_seed_high)
             do_fit(
                 opt_net,
                 meta_opt,
@@ -415,12 +431,13 @@ def train_l2lgdgd(args, run_dir: Path):
                 out_mul=args.out_mul,
                 training=True,
                 batch_size=args.bs,
-                data_seed=args.data_seed,
+                task_seed=task_seed,
             )
 
-        # meta-eval loss (original metric)
+        # ---------------- meta-eval loss (original metric): average over eval tasks ----------------
         eval_losses = []
         for _ in range(args.eval_tasks):
+            eval_seed = sample_task_seed(rng, args.eval_seed_low, args.eval_seed_high)
             traj = do_fit(
                 opt_net,
                 meta_opt=None,
@@ -429,29 +446,46 @@ def train_l2lgdgd(args, run_dir: Path):
                 out_mul=args.out_mul,
                 training=False,
                 batch_size=args.bs,
-                data_seed=args.data_seed,
+                task_seed=eval_seed,
             )
             eval_losses.append(sum(traj))
-        eval_meta_loss = float(np.mean(eval_losses))
+        eval_meta_loss = float(np.mean(eval_losses)) if eval_losses else float("nan")
 
-        # NEW: evaluate optimizee performance (train/test loss+acc) after inner training
-        final_params = run_inner_trajectory_get_final_params(
-            opt_net=opt_net,
-            optim_steps=args.optim_steps,
-            out_mul=args.out_mul,
-            batch_size=args.bs,
-            data_seed=args.data_seed,
-        )
-        train_loss, train_acc = eval_params_on_dataset(final_params, xtr, ytr, batch_size=512)
-        test_loss, test_acc = eval_params_on_dataset(final_params, xte, yte, batch_size=512)
+        # ---------------- report train/test loss+acc: average over report tasks ----------------
+        report_train_losses, report_train_accs = [], []
+        report_test_losses, report_test_accs = [], []
+
+        for _ in range(args.report_tasks):
+            rep_seed = sample_task_seed(rng, args.eval_seed_low, args.eval_seed_high)
+            (xtr, ytr), (xte, yte) = load_mnist1d(length=40, seed=int(rep_seed))
+
+            final_params = run_inner_trajectory_get_final_params(
+                opt_net=opt_net,
+                optim_steps=args.optim_steps,
+                out_mul=args.out_mul,
+                batch_size=args.bs,
+                task_seed=rep_seed,
+            )
+            tr_loss, tr_acc = eval_params_on_dataset(final_params, xtr, ytr, batch_size=512)
+            te_loss, te_acc = eval_params_on_dataset(final_params, xte, yte, batch_size=512)
+
+            report_train_losses.append(tr_loss)
+            report_train_accs.append(tr_acc)
+            report_test_losses.append(te_loss)
+            report_test_accs.append(te_acc)
+
+        report_train_loss = float(np.mean(report_train_losses)) if report_train_losses else float("nan")
+        report_train_acc = float(np.mean(report_train_accs)) if report_train_accs else float("nan")
+        report_test_loss = float(np.mean(report_test_losses)) if report_test_losses else float("nan")
+        report_test_acc = float(np.mean(report_test_accs)) if report_test_accs else float("nan")
 
         elapsed = time.time() - args._start_time
 
         print(
             f"[MetaEpoch {ep:03d}] "
             f"eval_meta_loss={eval_meta_loss:.6f} "
-            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
-            f"test_loss={test_loss:.4f} test_acc={test_acc:.4f}"
+            f"report_train_loss={report_train_loss:.4f} report_train_acc={report_train_acc:.4f} "
+            f"report_test_loss={report_test_loss:.4f} report_test_acc={report_test_acc:.4f}"
         )
 
         with open(train_log_path, "a", newline="") as f:
@@ -460,42 +494,43 @@ def train_l2lgdgd(args, run_dir: Path):
                 ep,
                 f"{elapsed:.3f}",
                 f"{eval_meta_loss:.8f}",
-                f"{train_loss:.8f}",
-                f"{train_acc:.6f}",
-                f"{test_loss:.8f}",
-                f"{test_acc:.6f}",
+                f"{report_train_loss:.8f}",
+                f"{report_train_acc:.6f}",
+                f"{report_test_loss:.8f}",
+                f"{report_test_acc:.6f}",
             ])
 
         if args.wandb and wandb is not None:
             wandb.log({
                 "meta_epoch": ep,
                 "eval_meta_loss": eval_meta_loss,
-                "train_loss": train_loss,
-                "train_acc": train_acc,
-                "test_loss": test_loss,
-                "test_acc": test_acc,
+                "report/train_loss": report_train_loss,
+                "report/train_acc": report_train_acc,
+                "report/test_loss": report_test_loss,
+                "report/test_acc": report_test_acc,
                 "time/elapsed_sec": elapsed,
             })
 
-        # save best checkpoint by eval_meta_loss (or you也可以改成按 test_acc)
+        # save best checkpoint by eval_meta_loss
         if eval_meta_loss < best_eval_meta_loss:
             best_eval_meta_loss = eval_meta_loss
             best_state = copy.deepcopy(opt_net.state_dict())
             torch.save(best_state, run_dir / "best_opt.pt")
 
-    # final result
     result = {
-        "method": "mnist1d_l2lgdgd",
+        "method": "mnist1d_l2lgdgd_task_distribution",
         "seed": int(args.seed),
-        "data_seed": int(args.data_seed),
         "meta_epochs": int(args.meta_epochs),
         "inner_loops_per_epoch": int(args.inner_loops_per_epoch),
         "eval_tasks": int(args.eval_tasks),
+        "report_tasks": int(args.report_tasks),
         "optim_steps": int(args.optim_steps),
         "unroll": int(args.unroll),
         "lr": float(args.lr),
         "bs": int(args.bs),
         "out_mul": float(args.out_mul),
+        "train_seed_range": [int(args.train_seed_low), int(args.train_seed_high)],
+        "eval_seed_range": [int(args.eval_seed_low), int(args.eval_seed_high)],
         "best_eval_meta_loss": float(best_eval_meta_loss),
         "device": str(device),
         "run_dir": str(run_dir),
@@ -509,18 +544,26 @@ def train_l2lgdgd(args, run_dir: Path):
 
 def build_argparser():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--data_seed", type=int, default=42)
 
     ap.add_argument("--meta_epochs", type=int, default=50)
     ap.add_argument("--inner_loops_per_epoch", type=int, default=20)
     ap.add_argument("--eval_tasks", type=int, default=10)
+    ap.add_argument("--report_tasks", type=int, default=5, help="how many eval tasks to average for train/test reporting")
 
     ap.add_argument("--optim_steps", type=int, default=100)
     ap.add_argument("--unroll", type=int, default=20)
-    ap.add_argument("--lr", type=float, default=1e-3)
+
+    ap.add_argument("--lr", type=float, default=1e-2, help="paper/notebook MNIST often uses ~1e-2; 1e-3 may be too small")
     ap.add_argument("--bs", type=int, default=128)
     ap.add_argument("--out_mul", type=float, default=0.1)
+
+    # NEW: task seed ranges (disjoint by default)
+    ap.add_argument("--train_seed_low", type=int, default=0)
+    ap.add_argument("--train_seed_high", type=int, default=9999)
+    ap.add_argument("--eval_seed_low", type=int, default=10000)
+    ap.add_argument("--eval_seed_high", type=int, default=10999)
 
     ap.add_argument("--runs_dir", type=str, default="runs")
 
@@ -538,7 +581,9 @@ def main():
     print(f"[INFO] device = {get_device()}")
 
     run_name = (
-        f"mnist1d_l2lgdgd_seed{args.seed}_data{args.data_seed}_"
+        f"mnist1d_l2lgdgd_seed{args.seed}_"
+        f"train{args.train_seed_low}-{args.train_seed_high}_"
+        f"eval{args.eval_seed_low}-{args.eval_seed_high}_"
         + datetime.now().strftime("%Y%m%d-%H%M%S")
     )
     run_dir = Path(args.runs_dir) / run_name
@@ -557,15 +602,19 @@ def main():
             name=args.wandb_run_name or run_name,
             config={
                 "seed": args.seed,
-                "data_seed": args.data_seed,
                 "meta_epochs": args.meta_epochs,
                 "inner_loops_per_epoch": args.inner_loops_per_epoch,
                 "eval_tasks": args.eval_tasks,
+                "report_tasks": args.report_tasks,
                 "optim_steps": args.optim_steps,
                 "unroll": args.unroll,
                 "lr": args.lr,
                 "bs": args.bs,
                 "out_mul": args.out_mul,
+                "train_seed_low": args.train_seed_low,
+                "train_seed_high": args.train_seed_high,
+                "eval_seed_low": args.eval_seed_low,
+                "eval_seed_high": args.eval_seed_high,
             },
         )
 
