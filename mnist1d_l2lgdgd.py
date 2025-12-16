@@ -64,7 +64,6 @@ def detach_var(v: torch.Tensor) -> torch.Tensor:
     device = get_device()
     out = v.detach().clone().to(device)
     out.requires_grad_(True)
-    out.retain_grad()
     return out
 
 
@@ -239,7 +238,8 @@ class LearnedOptimizer(nn.Module):
         self.out = nn.Linear(self.hidden_sz, 1)
 
     def _preprocess(self, g: torch.Tensor) -> torch.Tensor:
-        gd = g.data  # stop grad through gradient input
+        # stop grad through gradient input (paper / common ref behavior)
+        gd = g.data
         out = torch.zeros(gd.size(0), 2, device=gd.device)
         keep = (gd.abs() >= self.preproc_threshold).squeeze()
 
@@ -398,16 +398,16 @@ def do_fit(
     """
     One optimizee trajectory. Returns per-step optimizee losses.
 
-    Note:
-      - For training: truncated BPTT with unroll steps.
-      - For eval: set unroll=1 and do not update meta-opt.
+    FIXED semantics:
+      - Per-step gradients are computed via torch.autograd.grad (NO loss.backward for grads).
+      - Meta-loss backward happens ONLY at unroll boundaries (NO "backward then backward").
     """
     device = get_device()
     if training:
         opt_net.train()
     else:
         opt_net.eval()
-        unroll = 1
+        unroll = 1  # evaluation: no truncated BPTT segments
 
     task = MNIST1DTask(
         x, y,
@@ -419,34 +419,47 @@ def do_fit(
 
     optimizee = MLPOptimizee(hidden_dim=hidden_dim, init_scale=init_scale)
     n_params = _count_params_from_optimizee(optimizee)
+
+    # hidden/cell are coordinate-wise states, shape [num_params, hidden_sz]
     hidden = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
     cell = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
 
     if training and meta_opt is not None:
         meta_opt.zero_grad(set_to_none=True)
 
-    total_loss = None
+    total_loss: Optional[torch.Tensor] = None
     losses_ever: List[float] = []
 
     for step in range(1, optim_steps + 1):
+        # ---- forward loss ----
         loss = optimizee(task)
         losses_ever.append(float(loss.item()))
         total_loss = loss if total_loss is None else (total_loss + loss)
 
-        # populate grads on current optimizee params
-        loss.backward(retain_graph=training)
+        # ---- per-step grads: autograd.grad (NOT backward) ----
+        param_items = optimizee.all_named_parameters()
+        param_list = [p for _, p in param_items]
 
+        # retain_graph is needed in training because we will backward(total_loss) later at unroll boundary
+        grads = torch.autograd.grad(
+            loss,
+            param_list,
+            create_graph=False,              # paper/common ref: do not backprop through grads
+            retain_graph=bool(training),     # keep graph until meta backward
+            allow_unused=False,
+        )
+
+        # ---- apply learned optimizer update ----
         offset = 0
         new_params: Dict[str, torch.Tensor] = {}
         new_hidden = [torch.zeros_like(hh) for hh in hidden]
         new_cell = [torch.zeros_like(cc) for cc in cell]
 
-        for name, p in optimizee.all_named_parameters():
+        for (name, p), g in zip(param_items, grads):
             sz = p.numel()
-            if p.grad is None:
-                raise RuntimeError(f"Gradient is None for param {name}.")
-            grad_in = p.grad.reshape(sz, 1)
-            grad_in = detach_var(grad_in)  # detach gradient input like notebook
+
+            # gradient input is detached (paper/common ref); meta-grad flows through opt_net params via update
+            grad_in = g.detach().reshape(sz, 1)
 
             update, h_new, c_new = opt_net(
                 grad_in,
@@ -459,13 +472,14 @@ def do_fit(
                 new_cell[i][offset:offset + sz] = c_new[i]
 
             new_p = p + out_mul * update.view_as(p)
-            new_p.retain_grad()
             new_params[name] = new_p
             offset += sz
 
+        # ---- unroll boundary: do ONE meta backward and step ----
         if step % unroll == 0:
             if training and meta_opt is not None:
                 meta_opt.zero_grad(set_to_none=True)
+                assert total_loss is not None
                 total_loss.backward()
 
                 if meta_clip_norm is not None and float(meta_clip_norm) > 0:
@@ -473,18 +487,41 @@ def do_fit(
 
                 meta_opt.step()
 
-            optimizee = MLPOptimizee(
-                hidden_dim=hidden_dim,
-                init_scale=init_scale,
-                params={k: detach_var(v) for k, v in new_params.items()},
-            )
-            hidden = [detach_var(hh) for hh in new_hidden]
-            cell = [detach_var(cc) for cc in new_cell]
+            # truncate BPTT: detach params + states into fresh leaves for next segment
+            if training:
+                optimizee = MLPOptimizee(
+                    hidden_dim=hidden_dim,
+                    init_scale=init_scale,
+                    params={k: detach_var(v) for k, v in new_params.items()},
+                )
+                hidden = [hh.detach() for hh in new_hidden]
+                cell = [cc.detach() for cc in new_cell]
+            else:
+                # eval: always detach each step/segment
+                optimizee = MLPOptimizee(
+                    hidden_dim=hidden_dim,
+                    init_scale=init_scale,
+                    params={k: detach_var(v.detach()) for k, v in new_params.items()},
+                )
+                hidden = [hh.detach() for hh in new_hidden]
+                cell = [cc.detach() for cc in new_cell]
+
             total_loss = None
         else:
-            optimizee = MLPOptimizee(hidden_dim=hidden_dim, init_scale=init_scale, params=new_params)
-            hidden = new_hidden
-            cell = new_cell
+            # within unroll: keep graph
+            if training:
+                optimizee = MLPOptimizee(hidden_dim=hidden_dim, init_scale=init_scale, params=new_params)
+                hidden = new_hidden
+                cell = new_cell
+            else:
+                # eval: we set unroll=1 above, so should not reach here
+                optimizee = MLPOptimizee(
+                    hidden_dim=hidden_dim,
+                    init_scale=init_scale,
+                    params={k: detach_var(v.detach()) for k, v in new_params.items()},
+                )
+                hidden = [hh.detach() for hh in new_hidden]
+                cell = [cc.detach() for cc in new_cell]
 
     return losses_ever
 
@@ -748,12 +785,11 @@ def build_argparser():
     ap.add_argument("--bs", type=int, default=128)
     ap.add_argument("--out_mul", type=float, default=0.1)
 
-    # MLP init: for sigmoid stability, paper-style uses ~1e-3
     ap.add_argument("--init_scale", type=float, default=1e-3)
     ap.add_argument("--hidden_dim", type=int, default=20)
 
     ap.add_argument("--hidden_sz", type=int, default=20)
-    ap.add_argument("--no_preproc", action="store_true")  # default uses preproc=True
+    ap.add_argument("--no_preproc", action="store_true")
 
     ap.add_argument(
         "--preprocess_dir",
