@@ -3,26 +3,14 @@
 
 """
 MNIST-1D: Learning to Learn by Gradient Descent by Gradient Descent (L2L-GDGD)
-Paper-style coordinate-wise LSTM optimizer, BUT with Conv1D optimizee aligned to your F1/F2/F3.
+Paper-style coordinate-wise LSTM learned optimizer, with MLP optimizee (recommended for MNIST1D).
 
-Key alignment to your F1 code:
-  - Optimizee architecture: Conv1D backbone (same as build_model() in F1):
-        Conv1d(1->32,k=5,pad=2) + ReLU
-        MaxPool1d(2)
-        Conv1d(32->64,k=5,pad=2) + ReLU
-        AdaptiveAvgPool1d(1)
-        FC(64->64) + ReLU
-        FC(64->10)
-  - Data preprocessing:
-        uses {preprocess_dir}/seed_{data_seed}/split.json and norm.json
-        normalize per-position, then reshape input to [N, 1, 40]
-  - Report metrics on train/val/test with same split.
-
-L2L-GDGD specifics:
-  - Coordinate-wise optimizer: each scalar parameter has its own LSTM hidden/cell state
-  - Gradient preprocessing (Appendix A) optional
-  - Truncated BPTT with unroll steps
-  - Meta-gradient clipping optional
+Alignment to your baseline/F1/F2/F3 pipeline:
+  - Uses {preprocess_dir}/seed_{data_seed}/split.json and norm.json
+  - Train uses split["train_idx"], Val uses split["val_idx"], Test uses xte
+  - Per-position normalization (x - mean) / std
+  - Reports train/val/test loss+acc per meta-epoch
+  - Logs mean eval loss curve per meta-epoch for AUC comparison
 
 Outputs:
   - runs/<run_name>/train_log.csv
@@ -54,12 +42,6 @@ try:
     import wandb  # type: ignore
 except ImportError:
     wandb = None
-
-# Prefer the "stateless" functional_call (available in torch>=1.13).
-try:
-    from torch.nn.utils.stateless import functional_call as _functional_call
-except Exception:  # pragma: no cover
-    _functional_call = None
 
 
 # ---------------------- device / seed utils ----------------------
@@ -131,19 +113,11 @@ def apply_norm(x: np.ndarray, mean: np.ndarray, std: np.ndarray, eps: float = 1e
     return (x - mean[None, :]) / (std[None, :] + eps)
 
 
-def to_N1L(x: np.ndarray, length: int = 40) -> np.ndarray:
-    """
-    Convert to [N, 1, L] float32.
-    """
-    x2 = _to_N40(x, length=length).astype(np.float32)
-    return x2[:, None, :]
-
-
 # ---------------------- Task: minibatch stream (task distribution) ----------------------
 class MNIST1DTask:
     """
     A task is a minibatch stream over a (subsampled) dataset, with task-specific shuffle.
-    x expected shape: [N, 1, 40], y: [N]
+    x expected shape: [N, 40], y: [N]
     """
 
     def __init__(
@@ -170,7 +144,7 @@ class MNIST1DTask:
             x = x[idx]
             y = y[idx]
 
-        x_t = torch.from_numpy(x)  # [N,1,40]
+        x_t = torch.from_numpy(x)  # [N,40]
         y_t = torch.from_numpy(y)  # [N]
 
         gen = torch.Generator()
@@ -193,83 +167,76 @@ class MNIST1DTask:
             return next(self._iter)
 
 
-# ---------------------- Optimizee: Conv1D (same as your F1) ----------------------
-class Conv1DMNIST1D(nn.Module):
-    def __init__(self):
+# ---------------------- Optimizee: MLP (paper-style) ----------------------
+class MLPOptimizee(nn.Module):
+    """
+    MLP optimizee:
+      input(40) -> hidden(hidden_dim, sigmoid) -> output(10)
+
+    We store parameters in a dict of leaf tensors, to support meta-learning updates.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 20,
+        init_scale: float = 1e-3,
+        params: Optional[Dict[str, torch.Tensor]] = None,
+    ):
         super().__init__()
-        self.conv1 = nn.Conv1d(1, 32, kernel_size=5, padding=2)
-        self.relu = nn.ReLU(inplace=True)
-        self.pool = nn.MaxPool1d(kernel_size=2)
-        self.conv2 = nn.Conv1d(32, 64, kernel_size=5, padding=2)
-        self.gap = nn.AdaptiveAvgPool1d(output_size=1)
-        self.fc1 = nn.Linear(64, 64)
-        self.fc2 = nn.Linear(64, 10)
+        device = get_device()
+        self.hidden_dim = int(hidden_dim)
+        self.init_scale = float(init_scale)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B,1,40]
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = self.pool(x)
-        x = self.conv2(x)
-        x = self.relu(x)
-        x = self.gap(x)            # [B,64,1]
-        x = x.view(x.size(0), -1)  # [B,64]
-        x = self.fc1(x)
-        x = self.relu(x)
-        return self.fc2(x)         # [B,10]
+        if params is None:
+            p = {
+                "W1": torch.randn(40, self.hidden_dim, device=device) * self.init_scale,
+                "b1": torch.zeros(self.hidden_dim, device=device),
+                "W2": torch.randn(self.hidden_dim, 10, device=device) * self.init_scale,
+                "b2": torch.zeros(10, device=device),
+            }
+            self.params = {k: detach_var(v) for k, v in p.items()}
+        else:
+            self.params = params
 
+    def all_named_parameters(self):
+        return list(self.params.items())
 
-def init_conv1d_params(model: nn.Module, init_scale: float = 1.0) -> Dict[str, torch.Tensor]:
-    """
-    Create a dict of leaf tensors (requires_grad=True) from model's default initialized params.
-    If init_scale != 1.0, scales ALL parameters multiplicatively (for experiments).
-    """
-    device = get_device()
-    params: Dict[str, torch.Tensor] = {}
-    scale = float(init_scale)
+    def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
+        h = torch.sigmoid(x @ self.params["W1"] + self.params["b1"])
+        return h @ self.params["W2"] + self.params["b2"]
 
-    for name, p in model.named_parameters():
-        t = p.detach().to(device)
-        if scale != 1.0:
-            t = t * scale
-        params[name] = detach_var(t)
+    def forward_with_batch(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        logits = self.forward_logits(x)
+        return F.cross_entropy(logits, y)
 
-    return params
-
-
-def functional_forward(model: nn.Module, params: Dict[str, torch.Tensor], x: torch.Tensor) -> torch.Tensor:
-    """
-    Stateless forward with an explicit param dict.
-    """
-    if _functional_call is None:
-        raise RuntimeError(
-            "torch.nn.utils.stateless.functional_call is not available. "
-            "Please use a newer PyTorch (>=1.13 recommended)."
-        )
-    return _functional_call(model, params, (x,))
+    def forward(self, task: MNIST1DTask) -> torch.Tensor:
+        x, y = task.sample()
+        x = x.to(get_device())
+        y = y.to(get_device())
+        return self.forward_with_batch(x, y)
 
 
 # ---------------------- Learned Optimizer ----------------------
 class LearnedOptimizer(nn.Module):
     """
     Coordinate-wise 2-layer LSTM optimizer with gradient preprocessing (Appendix A).
-    NO tanh bound on output (matches the common reproduction notebook).
+    NO tanh bound on output (matches common reproduction notebooks).
     """
 
     def __init__(self, hidden_sz: int = 20, preproc: bool = True, preproc_factor: float = 10.0):
         super().__init__()
-        self.hidden_sz = hidden_sz
-        self.preproc = preproc
-        self.preproc_factor = preproc_factor
-        self.preproc_threshold = math.exp(-preproc_factor)
+        self.hidden_sz = int(hidden_sz)
+        self.preproc = bool(preproc)
+        self.preproc_factor = float(preproc_factor)
+        self.preproc_threshold = math.exp(-self.preproc_factor)
 
-        if preproc:
-            self.lstm1 = nn.LSTMCell(2, hidden_sz)
+        if self.preproc:
+            self.lstm1 = nn.LSTMCell(2, self.hidden_sz)
         else:
-            self.lstm1 = nn.LSTMCell(1, hidden_sz)
+            self.lstm1 = nn.LSTMCell(1, self.hidden_sz)
 
-        self.lstm2 = nn.LSTMCell(hidden_sz, hidden_sz)
-        self.out = nn.Linear(hidden_sz, 1)
+        self.lstm2 = nn.LSTMCell(self.hidden_sz, self.hidden_sz)
+        self.out = nn.Linear(self.hidden_sz, 1)
 
     def _preprocess(self, g: torch.Tensor) -> torch.Tensor:
         gd = g.data  # stop grad through gradient input
@@ -295,19 +262,12 @@ class LearnedOptimizer(nn.Module):
 
 
 # ---------------------- helpers ----------------------
-def _count_params(params: Dict[str, torch.Tensor]) -> int:
-    return int(sum(p.numel() for p in params.values()))
-
-
-def _iter_params_in_order(params: Dict[str, torch.Tensor]):
-    # dict insertion order is stable in Python 3.7+, and our init preserves module order
-    for k in params.keys():
-        yield k, params[k]
+def _count_params_from_optimizee(optimizee: MLPOptimizee) -> int:
+    return int(sum(p.numel() for _, p in optimizee.all_named_parameters()))
 
 
 @torch.no_grad()
 def eval_params_on_dataset(
-    model: nn.Module,
     params: Dict[str, torch.Tensor],
     x_np: np.ndarray,
     y_np: np.ndarray,
@@ -325,7 +285,10 @@ def eval_params_on_dataset(
     for i in range(0, n, batch_size):
         xb = x[i:i + batch_size]
         yb = y[i:i + batch_size]
-        logits = functional_forward(model, params, xb)
+
+        h = torch.sigmoid(xb @ params["W1"] + params["b1"])
+        logits = h @ params["W2"] + params["b2"]
+
         loss = F.cross_entropy(logits, yb, reduction="sum")
         total_loss += float(loss.item())
         total_correct += int((logits.argmax(dim=1) == yb).sum().item())
@@ -335,7 +298,6 @@ def eval_params_on_dataset(
 
 
 def run_inner_trajectory_get_final_params(
-    model: nn.Module,
     opt_net: LearnedOptimizer,
     x_train: np.ndarray,
     y_train: np.ndarray,
@@ -344,6 +306,7 @@ def run_inner_trajectory_get_final_params(
     batch_size: int,
     task_seed: int,
     init_scale: float,
+    hidden_dim: int,
     task_subsample_frac: float,
 ) -> Dict[str, torch.Tensor]:
     """
@@ -361,8 +324,10 @@ def run_inner_trajectory_get_final_params(
         subsample_frac=task_subsample_frac,
     )
 
-    params = init_conv1d_params(model, init_scale=init_scale)
-    n_params = _count_params(params)
+    optimizee = MLPOptimizee(hidden_dim=hidden_dim, init_scale=init_scale)
+    params = {k: v for k, v in optimizee.params.items()}
+
+    n_params = int(sum(p.numel() for p in params.values()))
     hidden = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
     cell = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
 
@@ -371,7 +336,8 @@ def run_inner_trajectory_get_final_params(
         xb = xb.to(device)
         yb = yb.to(device)
 
-        logits = functional_forward(model, params, xb)
+        h = torch.sigmoid(xb @ params["W1"] + params["b1"])
+        logits = h @ params["W2"] + params["b2"]
         loss = F.cross_entropy(logits, yb)
 
         grads = torch.autograd.grad(
@@ -384,17 +350,17 @@ def run_inner_trajectory_get_final_params(
 
         offset = 0
         new_params: Dict[str, torch.Tensor] = {}
-        new_hidden = [torch.zeros_like(h) for h in hidden]
-        new_cell = [torch.zeros_like(c) for c in cell]
+        new_hidden = [torch.zeros_like(hh) for hh in hidden]
+        new_cell = [torch.zeros_like(cc) for cc in cell]
 
-        for (name, p), g in zip(_iter_params_in_order(params), grads):
+        for (name, p), g in zip(params.items(), grads):
             sz = p.numel()
             grad_vec = g.detach().reshape(sz, 1)
 
             update, h_new, c_new = opt_net(
                 grad_vec,
-                [h[offset:offset + sz] for h in hidden],
-                [c[offset:offset + sz] for c in cell],
+                [hh[offset:offset + sz] for hh in hidden],
+                [cc[offset:offset + sz] for cc in cell],
             )
 
             for i in range(2):
@@ -414,7 +380,6 @@ def run_inner_trajectory_get_final_params(
 
 # ---------------------- Meta-training (truncated BPTT) ----------------------
 def do_fit(
-    model: nn.Module,
     opt_net: LearnedOptimizer,
     meta_opt: Optional[optim.Optimizer],
     x: np.ndarray,
@@ -425,15 +390,17 @@ def do_fit(
     out_mul: float = 0.1,
     training: bool = True,
     batch_size: int = 128,
-    init_scale: float = 1.0,
+    init_scale: float = 1e-3,
+    hidden_dim: int = 20,
     task_subsample_frac: float = 1.0,
     meta_clip_norm: float = 1.0,
 ) -> List[float]:
     """
     One optimizee trajectory. Returns per-step optimizee losses.
-    Notebook-style:
-      - loss.backward(retain_graph=training) so we can backprop meta-loss every unroll steps
-      - gradients are detached before feeding to opt_net (via detach_var)
+
+    Note:
+      - For training: truncated BPTT with unroll steps.
+      - For eval: set unroll=1 and do not update meta-opt.
     """
     device = get_device()
     if training:
@@ -450,8 +417,8 @@ def do_fit(
         subsample_frac=task_subsample_frac,
     )
 
-    params = init_conv1d_params(model, init_scale=init_scale)
-    n_params = _count_params(params)
+    optimizee = MLPOptimizee(hidden_dim=hidden_dim, init_scale=init_scale)
+    n_params = _count_params_from_optimizee(optimizee)
     hidden = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
     cell = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
 
@@ -462,25 +429,19 @@ def do_fit(
     losses_ever: List[float] = []
 
     for step in range(1, optim_steps + 1):
-        xb, yb = task.sample()
-        xb = xb.to(device)
-        yb = yb.to(device)
-
-        logits = functional_forward(model, params, xb)
-        loss = F.cross_entropy(logits, yb)
+        loss = optimizee(task)
         losses_ever.append(float(loss.item()))
-
         total_loss = loss if total_loss is None else (total_loss + loss)
 
-        # populate grads on current params
+        # populate grads on current optimizee params
         loss.backward(retain_graph=training)
 
         offset = 0
         new_params: Dict[str, torch.Tensor] = {}
-        new_hidden = [torch.zeros_like(h) for h in hidden]
-        new_cell = [torch.zeros_like(c) for c in cell]
+        new_hidden = [torch.zeros_like(hh) for hh in hidden]
+        new_cell = [torch.zeros_like(cc) for cc in cell]
 
-        for name, p in _iter_params_in_order(params):
+        for name, p in optimizee.all_named_parameters():
             sz = p.numel()
             if p.grad is None:
                 raise RuntimeError(f"Gradient is None for param {name}.")
@@ -489,8 +450,8 @@ def do_fit(
 
             update, h_new, c_new = opt_net(
                 grad_in,
-                [h[offset:offset + sz] for h in hidden],
-                [c[offset:offset + sz] for c in cell],
+                [hh[offset:offset + sz] for hh in hidden],
+                [cc[offset:offset + sz] for cc in cell],
             )
 
             for i in range(2):
@@ -512,12 +473,16 @@ def do_fit(
 
                 meta_opt.step()
 
-            params = {k: detach_var(v) for k, v in new_params.items()}
-            hidden = [detach_var(h) for h in new_hidden]
-            cell = [detach_var(c) for c in new_cell]
+            optimizee = MLPOptimizee(
+                hidden_dim=hidden_dim,
+                init_scale=init_scale,
+                params={k: detach_var(v) for k, v in new_params.items()},
+            )
+            hidden = [detach_var(hh) for hh in new_hidden]
+            cell = [detach_var(cc) for cc in new_cell]
             total_loss = None
         else:
-            params = new_params
+            optimizee = MLPOptimizee(hidden_dim=hidden_dim, init_scale=init_scale, params=new_params)
             hidden = new_hidden
             cell = new_cell
 
@@ -529,7 +494,6 @@ def train_l2lgdgd(args, run_dir: Path):
     device = get_device()
     set_seed(args.seed)
 
-    model = Conv1DMNIST1D().to(device)
     opt_net = LearnedOptimizer(hidden_sz=args.hidden_sz, preproc=(not args.no_preproc)).to(device)
     meta_opt = optim.Adam(opt_net.parameters(), lr=args.lr)
 
@@ -540,7 +504,7 @@ def train_l2lgdgd(args, run_dir: Path):
     ytr = np.asarray(ytr, dtype=np.int64)
     yte = np.asarray(yte, dtype=np.int64)
 
-    # Apply preprocess split+norm if provided (to match F1/F2/F3)
+    # Apply preprocess split+norm (to align with baselines/F*)
     if args.preprocess_dir is not None:
         split, mean, std = load_split_and_norm(Path(args.preprocess_dir), args.data_seed)
         train_idx = np.asarray(split["train_idx"], dtype=np.int64)
@@ -553,15 +517,9 @@ def train_l2lgdgd(args, run_dir: Path):
         x_test = apply_norm(xte, mean, std)
         y_test = yte
     else:
-        # fallback: no split, use whole train as train, no val
         x_train, y_train = xtr, ytr
         x_val, y_val = xtr[:0], ytr[:0]
         x_test, y_test = xte, yte
-
-    # reshape to [N,1,40]
-    x_train = to_N1L(x_train, length=40)
-    x_val = to_N1L(x_val, length=40) if x_val.size else x_val.reshape(0, 1, 40).astype(np.float32)
-    x_test = to_N1L(x_test, length=40)
 
     best_eval_meta_loss = float("inf")
     best_state = None
@@ -597,7 +555,6 @@ def train_l2lgdgd(args, run_dir: Path):
         for _ in range(args.inner_loops_per_epoch):
             task_seed = sample_task_seed(args.train_seed_low, args.train_seed_high)
             do_fit(
-                model=model,
                 opt_net=opt_net,
                 meta_opt=meta_opt,
                 x=x_train,
@@ -609,6 +566,7 @@ def train_l2lgdgd(args, run_dir: Path):
                 training=True,
                 batch_size=args.bs,
                 init_scale=args.init_scale,
+                hidden_dim=args.hidden_dim,
                 task_subsample_frac=args.task_subsample_frac,
                 meta_clip_norm=args.meta_clip_norm,
             )
@@ -618,7 +576,6 @@ def train_l2lgdgd(args, run_dir: Path):
         for _ in range(args.eval_tasks):
             task_seed = sample_task_seed(args.eval_seed_low, args.eval_seed_high)
             traj = do_fit(
-                model=model,
                 opt_net=opt_net,
                 meta_opt=None,
                 x=x_train,
@@ -630,6 +587,7 @@ def train_l2lgdgd(args, run_dir: Path):
                 training=False,
                 batch_size=args.bs,
                 init_scale=args.init_scale,
+                hidden_dim=args.hidden_dim,
                 task_subsample_frac=args.task_subsample_frac,
                 meta_clip_norm=args.meta_clip_norm,
             )
@@ -637,9 +595,9 @@ def train_l2lgdgd(args, run_dir: Path):
 
         eval_meta_loss = float(np.mean([sum(t) for t in eval_trajs]))
 
-        # save mean eval curve for AUC comparison
-        traj_arr = np.asarray(eval_trajs, dtype=np.float32)  # [T, steps]
+        traj_arr = np.asarray(eval_trajs, dtype=np.float32)  # [eval_tasks, steps]
         mean_curve = traj_arr.mean(axis=0)
+
         with open(curve_eval_path, "a", newline="") as f:
             writer = csv.writer(f)
             for s, lv in enumerate(mean_curve, start=1):
@@ -653,7 +611,6 @@ def train_l2lgdgd(args, run_dir: Path):
         for _ in range(args.report_tasks):
             task_seed = sample_task_seed(args.eval_seed_low, args.eval_seed_high)
             final_params = run_inner_trajectory_get_final_params(
-                model=model,
                 opt_net=opt_net,
                 x_train=x_train,
                 y_train=y_train,
@@ -662,19 +619,19 @@ def train_l2lgdgd(args, run_dir: Path):
                 batch_size=args.bs,
                 task_seed=task_seed,
                 init_scale=args.init_scale,
+                hidden_dim=args.hidden_dim,
                 task_subsample_frac=args.task_subsample_frac,
             )
 
-            tr_loss, tr_acc = eval_params_on_dataset(model, final_params, x_train, y_train, batch_size=512)
-            te_loss, te_acc = eval_params_on_dataset(model, final_params, x_test, y_test, batch_size=512)
-
+            tr_loss, tr_acc = eval_params_on_dataset(final_params, x_train, y_train, batch_size=512)
+            te_loss, te_acc = eval_params_on_dataset(final_params, x_test, y_test, batch_size=512)
             rep_train_losses.append(tr_loss)
             rep_train_accs.append(tr_acc)
             rep_test_losses.append(te_loss)
             rep_test_accs.append(te_acc)
 
             if x_val.shape[0] > 0:
-                va_loss, va_acc = eval_params_on_dataset(model, final_params, x_val, y_val, batch_size=512)
+                va_loss, va_acc = eval_params_on_dataset(final_params, x_val, y_val, batch_size=512)
                 rep_val_losses.append(va_loss)
                 rep_val_accs.append(va_acc)
 
@@ -725,9 +682,8 @@ def train_l2lgdgd(args, run_dir: Path):
                 "report/test_loss": report_test_loss,
                 "report/test_acc": report_test_acc,
                 "time/elapsed_sec": elapsed,
+                "eval_curve/auc_sum": float(mean_curve.sum()),
             })
-            # log AUC proxy directly (mean_curve sum)
-            wandb.log({"eval_curve/auc_sum": float(mean_curve.sum())})
 
         if eval_meta_loss < best_eval_meta_loss:
             best_eval_meta_loss = eval_meta_loss
@@ -735,8 +691,8 @@ def train_l2lgdgd(args, run_dir: Path):
             torch.save(best_state, run_dir / "best_opt.pt")
 
     result = {
-        "method": "mnist1d_l2lgdgd_conv1d_taskdist",
-        "optimizee": "Conv1D",
+        "method": "mnist1d_l2lgdgd_mlp",
+        "optimizee": f"MLP(40->{args.hidden_dim}(sigmoid)->10)",
         "seed": int(args.seed),
         "data_seed": int(args.data_seed),
         "meta_epochs": int(args.meta_epochs),
@@ -750,6 +706,7 @@ def train_l2lgdgd(args, run_dir: Path):
         "out_mul": float(args.out_mul),
         "init_scale": float(args.init_scale),
         "hidden_sz": int(args.hidden_sz),
+        "hidden_dim": int(args.hidden_dim),
         "preproc": bool(not args.no_preproc),
         "preprocess_dir": (str(args.preprocess_dir) if args.preprocess_dir is not None else None),
         "task_subsample_frac": float(args.task_subsample_frac),
@@ -789,10 +746,11 @@ def build_argparser():
 
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--bs", type=int, default=128)
-    ap.add_argument("--out_mul", type=float, default=0.05)
+    ap.add_argument("--out_mul", type=float, default=0.1)
 
-    # Conv1D init: default keep PyTorch's init (scale=1.0)
-    ap.add_argument("--init_scale", type=float, default=1.0)
+    # MLP init: for sigmoid stability, paper-style uses ~1e-3
+    ap.add_argument("--init_scale", type=float, default=1e-3)
+    ap.add_argument("--hidden_dim", type=int, default=20)
 
     ap.add_argument("--hidden_sz", type=int, default=20)
     ap.add_argument("--no_preproc", action="store_true")  # default uses preproc=True
@@ -801,7 +759,7 @@ def build_argparser():
         "--preprocess_dir",
         type=str,
         default="artifacts/preprocess",
-        help="Loads split.json + norm.json under {preprocess_dir}/seed_{data_seed}/ to align with F1/F2/F3.",
+        help="Loads split.json + norm.json under {preprocess_dir}/seed_{data_seed}/.",
     )
 
     ap.add_argument("--task_subsample_frac", type=float, default=1.0)
@@ -816,7 +774,7 @@ def build_argparser():
 
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", type=str, default="l2o-online")
-    ap.add_argument("--wandb_group", type=str, default="mnist1d_l2lgdgd_conv1d")
+    ap.add_argument("--wandb_group", type=str, default="mnist1d_l2lgdgd_mlp")
     ap.add_argument("--wandb_run_name", type=str, default=None)
 
     return ap
@@ -828,10 +786,11 @@ def main():
     print(f"[INFO] device = {get_device()}")
 
     run_name = (
-        f"mnist1d_l2lgdgd_conv1d_seed{args.seed}_data{args.data_seed}_"
+        f"mnist1d_l2lgdgd_mlp_seed{args.seed}_data{args.data_seed}_"
         f"sub{args.task_subsample_frac}_clip{args.meta_clip_norm}_"
         f"steps{args.optim_steps}_unroll{args.unroll}_"
         f"lr{args.lr}_out{args.out_mul}_initscale{args.init_scale}_"
+        f"hd{args.hidden_dim}_"
         + datetime.now().strftime("%Y%m%d-%H%M%S")
     )
     run_dir = Path(args.runs_dir) / run_name
