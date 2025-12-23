@@ -30,6 +30,7 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
 from data_mnist1d import load_mnist1d
+from loader_utils import LoaderCfg, make_train_val_loaders, make_eval_loader
 
 
 # ---------------------- Data utilities ----------------------
@@ -286,24 +287,24 @@ def main():
     val_y_t = torch.from_numpy(ytr[split["val_idx"]]).to(dtype=torch.long)
     test_y_t = torch.from_numpy(yte).to(dtype=torch.long)
 
-    train_loader = DataLoader(
-        TensorDataset(train_x_t, train_y_t),
-        batch_size=args.bs,
-        shuffle=True,
-        drop_last=False,
+    cfg = LoaderCfg(batch_size=args.bs, num_workers=0)
+
+    train_ds = TensorDataset(train_x_t, train_y_t)
+    val_ds = TensorDataset(val_x_t, val_y_t)
+    test_ds = TensorDataset(test_x_t, test_y_t)
+
+    # drop_last is unified to True for training (as requested)
+    train_loader, val_loader = make_train_val_loaders(
+        train_ds,
+        val_ds,
+        cfg,
+        seed=args.seed,
+        train_shuffle=True,
+        val_shuffle=False,
+        train_drop_last=True,
+        val_drop_last=False,
     )
-    val_loader = DataLoader(
-        TensorDataset(val_x_t, val_y_t),
-        batch_size=args.bs,
-        shuffle=False,
-        drop_last=False,
-    )
-    test_loader = DataLoader(
-        TensorDataset(test_x_t, test_y_t),
-        batch_size=args.bs,
-        shuffle=False,
-        drop_last=False,
-    )
+    test_loader = make_eval_loader(test_ds, batch_size=args.bs, num_workers=0, pin_memory=False)
 
     model = Conv1DMNIST1D().to(device)
     if args.opt == "sgd":

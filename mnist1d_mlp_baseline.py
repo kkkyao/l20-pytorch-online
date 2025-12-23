@@ -30,6 +30,7 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
 from data_mnist1d import load_mnist1d
+from loader_utils import LoaderCfg, make_train_val_loaders, make_eval_loader
 
 # Optional wandb
 try:
@@ -291,21 +292,26 @@ def main():
     y_val_t = torch.from_numpy(ytr[val_idx]).to(torch.long)
     y_test_t = torch.from_numpy(yte).to(torch.long)
 
-    train_loader = DataLoader(
-        TensorDataset(x_train_t, y_train_t),
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
+    train_dataset = TensorDataset(x_train_t, y_train_t)
+    val_dataset = TensorDataset(x_val_t, y_val_t)
+    test_dataset = TensorDataset(x_test_t, y_test_t)
+
+    cfg = LoaderCfg(batch_size=args.batch_size, num_workers=0)
+    train_loader, val_loader = make_train_val_loaders(
+        train_dataset,
+        val_dataset,
+        cfg,
+        seed=args.seed,
+        train_shuffle=True,
+        val_shuffle=False,
+        train_drop_last=True,
+        val_drop_last=True,
     )
-    val_loader = DataLoader(
-        TensorDataset(x_val_t, y_val_t),
+    test_loader = make_eval_loader(
+        test_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
-    )
-    test_loader = DataLoader(
-        TensorDataset(x_test_t, y_test_t),
-        batch_size=args.batch_size,
-        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
     )
 
     # ---------------- model ----------------

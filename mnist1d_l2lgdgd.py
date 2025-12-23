@@ -1,79 +1,132 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-MNIST-1D: Learning to Learn by Gradient Descent by Gradient Descent (L2L-GDGD)
-Paper-style coordinate-wise LSTM learned optimizer, with MLP optimizee (recommended for MNIST1D).
+MNIST-1D: Online learned optimizer baseline (coordinate-wise LSTM),
+aligned with your F1/F2/F3 pipeline (single-task online meta-learning).
 
-Alignment to your baseline/F1/F2/F3 pipeline:
-  - Uses {preprocess_dir}/seed_{data_seed}/split.json and norm.json
-  - Train uses split["train_idx"], Val uses split["val_idx"], Test uses xte
-  - Per-position normalization (x - mean) / std
-  - Reports train/val/test loss+acc per meta-epoch
-  - Logs mean eval loss curve per meta-epoch for AUC comparison
+Key alignment:
+  - Same preprocess artifacts: split.json + norm.json under preprocess_dir/seed_{data_seed}
+  - Same Train/Val/Test split usage
+  - Same DataLoader pattern: each train batch pairs with one val batch
+  - Same backbone option as your MNIST1D MLP scripts (build_mlp)
 
-Outputs:
-  - runs/<run_name>/train_log.csv
-  - runs/<run_name>/curve_eval_mean.csv   (mean eval-task loss curve per meta-epoch)
-  - runs/<run_name>/best_opt.pt
-  - runs/<run_name>/result.json
+Method:
+  - Learned optimizer is a coordinate-wise 2-layer LSTM that outputs per-parameter update.
+  - Online meta-objective (first-order, no 2nd derivatives):
+        meta_loss = - <grad_val (stop-grad), Δw(phi)> + small regularizer
+  - Update optimizer params phi each train batch, then apply Δw with updated phi.
+  - Hidden states are carried across steps but DETACHED each step (online / no BPTT).
+
+Paper reference for coordinate-wise LSTM + gradient preprocessing:
+  "Learning to learn by gradient descent by gradient descent" (Appendix A).
 """
 
 import argparse
-import copy
-import csv
 import json
-import math
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from data_mnist1d import load_mnist1d
 
+# Optional wandb
 try:
     import wandb  # type: ignore
 except ImportError:
     wandb = None
 
 
-# ---------------------- device / seed utils ----------------------
-def get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ------------------------------- Utilities -------------------------------
+
+class BatchLossLogger:
+    """Per-batch train loss logger (aligned style with your F-scripts)."""
+
+    def __init__(self, run_dir: Path, meta: dict, filename: str, flush_every: int = 200):
+        self.run_dir = Path(run_dir)
+        self.meta = meta
+        self.flush_every = flush_every
+        self.global_iter = 0
+        self.curr_epoch = 0
+        self.rows = []
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.curve_path = self.run_dir / filename
+        with open(self.curve_path, "w") as f:
+            f.write("iter,epoch,loss,method,seed,opt,lr\n")
+
+    def on_epoch_begin(self, epoch: int):
+        self.curr_epoch = int(epoch)
+
+    def on_train_batch_end(self, loss_value: float):
+        row = [
+            self.global_iter,
+            self.curr_epoch,
+            float(loss_value),
+            str(self.meta.get("method", "unknown")).lower(),
+            int(self.meta.get("seed", -1)),
+            str(self.meta.get("opt", "unknown")).lower(),
+            float(self.meta.get("lr", float("nan"))),
+        ]
+        self.rows.append(row)
+        self.global_iter += 1
+        if len(self.rows) >= self.flush_every:
+            self._flush()
+
+    def on_train_end(self):
+        if self.rows:
+            self._flush()
+
+    def _flush(self):
+        with open(self.curve_path, "a") as f:
+            for r in self.rows:
+                f.write(",".join(map(str, r)) + "\n")
+        self.rows.clear()
 
 
-def set_seed(seed: int):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def set_seed(s: int):
+    np.random.seed(s)
+    torch.manual_seed(s)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(s)
 
 
-def detach_var(v: torch.Tensor) -> torch.Tensor:
+def load_artifacts(preprocess_dir: Path, seed: int):
     """
-    Detach from previous graph and create a fresh leaf tensor with requires_grad=True.
-    Critical for truncated BPTT in L2L-GDGD.
+    Load preprocessing artifacts:
+      - split.json: {train_idx, val_idx}
+      - norm.json:  {mean, std}
     """
-    device = get_device()
-    out = v.detach().clone().to(device)
-    out.requires_grad_(True)
-    return out
+    pdir = Path(preprocess_dir) / f"seed_{seed}"
+    split_path = pdir / "split.json"
+    norm_path = pdir / "norm.json"
+
+    if not split_path.exists() or not norm_path.exists():
+        raise FileNotFoundError(
+            f"Preprocess artifacts not found under: {pdir}. Run preprocess first."
+        )
+
+    with open(split_path, "r", encoding="utf-8") as f:
+        split = json.load(f)
+    with open(norm_path, "r", encoding="utf-8") as f:
+        norm = json.load(f)
+
+    return split, norm
 
 
-# ---------------------- Data helpers ----------------------
-def _to_N40(x: np.ndarray, length: int = 40) -> np.ndarray:
+def apply_norm_np(x: np.ndarray, mean: np.ndarray, std: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    return (x - mean[None, :]) / (std[None, :] + eps)
+
+
+def to_NL(x: np.ndarray, length: int) -> np.ndarray:
     x = np.asarray(x)
     if x.ndim == 2 and x.shape[1] == length:
         return x
     if x.ndim == 3:
-        # [N, 40, 1] or [N, 1, 40]
         if x.shape[1] == length and x.shape[2] == 1:
             return x[:, :, 0]
         if x.shape[1] == 1 and x.shape[2] == length:
@@ -81,145 +134,51 @@ def _to_N40(x: np.ndarray, length: int = 40) -> np.ndarray:
     raise AssertionError(f"Unexpected x shape: {x.shape}")
 
 
-def load_split_and_norm(preprocess_dir: Path, data_seed: int) -> Tuple[dict, np.ndarray, np.ndarray]:
-    """
-    Expect:
-      {preprocess_dir}/seed_{data_seed}/split.json  -> {"train_idx": [...], "val_idx": [...]}
-      {preprocess_dir}/seed_{data_seed}/norm.json   -> {"mean": [...len40...], "std": [...len40...]}
+# --------------------------- MLP backbone ---------------------------
 
-    Returns: (split, mean, std)
-    """
-    pdir = preprocess_dir / f"seed_{data_seed}"
-    split_path = pdir / "split.json"
-    norm_path = pdir / "norm.json"
-    if not split_path.exists():
-        raise FileNotFoundError(f"split.json not found: {split_path}")
-    if not norm_path.exists():
-        raise FileNotFoundError(f"norm.json not found: {norm_path}")
+def build_mlp(
+    input_len: int = 40,
+    num_layers: int = 5,
+    width: int = 128,
+    activation: str = "relu",
+) -> nn.Module:
+    act_layer = nn.ReLU if activation.lower() == "relu" else nn.ReLU
 
-    with open(split_path, "r", encoding="utf-8") as f:
-        split = json.load(f)
-    with open(norm_path, "r", encoding="utf-8") as f:
-        norm = json.load(f)
+    class MLPBackbone(nn.Module):
+        def __init__(self, length: int):
+            super().__init__()
+            layers = []
+            in_dim = length
+            for _ in range(max(0, num_layers)):
+                layers.append(nn.Linear(in_dim, width))
+                layers.append(act_layer(inplace=True))
+                in_dim = width
+            self.mlp = nn.Sequential(*layers)
+            self.out = nn.Linear(in_dim, 10)
 
-    mean = np.asarray(norm["mean"], dtype=np.float32)
-    std = np.asarray(norm["std"], dtype=np.float32)
-    return split, mean, std
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = self.mlp(x)
+            return self.out(x)
 
-
-def apply_norm(x: np.ndarray, mean: np.ndarray, std: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float32)
-    return (x - mean[None, :]) / (std[None, :] + eps)
+    return MLPBackbone(input_len)
 
 
-# ---------------------- Task: minibatch stream (task distribution) ----------------------
-class MNIST1DTask:
-    """
-    A task is a minibatch stream over a (subsampled) dataset, with task-specific shuffle.
-    x expected shape: [N, 40], y: [N]
-    """
+# ---------------------- Learned Optimizer (coordinate-wise LSTM) ----------------------
 
-    def __init__(
-        self,
-        x: np.ndarray,
-        y: np.ndarray,
-        batch_size: int,
-        task_seed: int,
-        drop_last: bool = True,
-        subsample_frac: float = 1.0,
-        min_subsample: int = 256,
-    ):
-        x = np.asarray(x, dtype=np.float32)
-        y = np.asarray(y, dtype=np.int64)
-
-        subsample_frac = float(subsample_frac)
-        if subsample_frac < 1.0:
-            rng = np.random.RandomState(int(task_seed))
-            n = x.shape[0]
-            m = int(n * subsample_frac)
-            m = max(min_subsample, m)
-            m = min(n, m)
-            idx = rng.choice(n, size=m, replace=False)
-            x = x[idx]
-            y = y[idx]
-
-        x_t = torch.from_numpy(x)  # [N,40]
-        y_t = torch.from_numpy(y)  # [N]
-
-        gen = torch.Generator()
-        gen.manual_seed(int(task_seed))
-
-        self.loader = DataLoader(
-            TensorDataset(x_t, y_t),
-            batch_size=batch_size,
-            shuffle=True,
-            drop_last=drop_last,
-            generator=gen,
-        )
-        self._iter = iter(self.loader)
-
-    def sample(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        try:
-            return next(self._iter)
-        except StopIteration:
-            self._iter = iter(self.loader)
-            return next(self._iter)
-
-
-# ---------------------- Optimizee: MLP (paper-style) ----------------------
-class MLPOptimizee(nn.Module):
-    """
-    MLP optimizee:
-      input(40) -> hidden(hidden_dim, sigmoid) -> output(10)
-
-    We store parameters in a dict of leaf tensors, to support meta-learning updates.
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int = 20,
-        init_scale: float = 1e-3,
-        params: Optional[Dict[str, torch.Tensor]] = None,
-    ):
-        super().__init__()
-        device = get_device()
-        self.hidden_dim = int(hidden_dim)
-        self.init_scale = float(init_scale)
-
-        if params is None:
-            p = {
-                "W1": torch.randn(40, self.hidden_dim, device=device) * self.init_scale,
-                "b1": torch.zeros(self.hidden_dim, device=device),
-                "W2": torch.randn(self.hidden_dim, 10, device=device) * self.init_scale,
-                "b2": torch.zeros(10, device=device),
-            }
-            self.params = {k: detach_var(v) for k, v in p.items()}
-        else:
-            self.params = params
-
-    def all_named_parameters(self):
-        return list(self.params.items())
-
-    def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
-        h = torch.sigmoid(x @ self.params["W1"] + self.params["b1"])
-        return h @ self.params["W2"] + self.params["b2"]
-
-    def forward_with_batch(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        logits = self.forward_logits(x)
-        return F.cross_entropy(logits, y)
-
-    def forward(self, task: MNIST1DTask) -> torch.Tensor:
-        x, y = task.sample()
-        x = x.to(get_device())
-        y = y.to(get_device())
-        return self.forward_with_batch(x, y)
-
-
-# ---------------------- Learned Optimizer ----------------------
 class LearnedOptimizer(nn.Module):
     """
-    Coordinate-wise 2-layer LSTM optimizer with gradient preprocessing (Appendix A).
-    NO tanh bound on output (matches common reproduction notebooks).
+    Coordinate-wise 2-layer LSTM optimizer.
+
+    Gradient preprocessing from paper Appendix A:
+      g -> (log(|g|)/p, sign(g)) if |g| >= exp(-p)
+           (-1, exp(p)*g)       otherwise
+
+    Forward expects:
+      grad_vec: [N, 1]
+      hidden/cell: lists of length 2, each [N, hidden_sz]
+    Outputs:
+      update_vec: [N, 1]
+      new hidden/cell
     """
 
     def __init__(self, hidden_sz: int = 20, preproc: bool = True, preproc_factor: float = 10.0):
@@ -227,618 +186,137 @@ class LearnedOptimizer(nn.Module):
         self.hidden_sz = int(hidden_sz)
         self.preproc = bool(preproc)
         self.preproc_factor = float(preproc_factor)
-        self.preproc_threshold = math.exp(-self.preproc_factor)
+        self.preproc_threshold = float(np.exp(-self.preproc_factor))
 
-        if self.preproc:
-            self.lstm1 = nn.LSTMCell(2, self.hidden_sz)
-        else:
-            self.lstm1 = nn.LSTMCell(1, self.hidden_sz)
-
+        in_dim = 2 if self.preproc else 1
+        self.lstm1 = nn.LSTMCell(in_dim, self.hidden_sz)
         self.lstm2 = nn.LSTMCell(self.hidden_sz, self.hidden_sz)
         self.out = nn.Linear(self.hidden_sz, 1)
 
     def _preprocess(self, g: torch.Tensor) -> torch.Tensor:
-        # stop grad through gradient input (paper / common ref behavior)
-        gd = g.data
-        out = torch.zeros(gd.size(0), 2, device=gd.device)
-        keep = (gd.abs() >= self.preproc_threshold).squeeze()
+        # g: [N,1]
+        gd = g.detach()  # stop-grad through gradient input (first-order)
+        out = torch.zeros(gd.size(0), 2, device=gd.device, dtype=gd.dtype)
 
-        out[:, 0][keep] = (torch.log(gd.abs()[keep] + 1e-8) / self.preproc_factor).squeeze()
-        out[:, 1][keep] = torch.sign(gd[keep]).squeeze()
+        # keep: [N]
+        keep = (gd.abs() >= self.preproc_threshold).view(-1)
 
-        out[:, 0][~keep] = -1
-        out[:, 1][~keep] = (math.exp(self.preproc_factor) * gd[~keep]).squeeze()
+        # branch 1
+        out[keep, 0] = (torch.log(gd[keep].abs() + 1e-8) / self.preproc_factor).view(-1)
+        out[keep, 1] = torch.sign(gd[keep]).view(-1)
+
+        # branch 2
+        out[~keep, 0] = -1.0
+        out[~keep, 1] = (np.exp(self.preproc_factor) * gd[~keep]).view(-1)
         return out
 
-    def forward(self, grad: torch.Tensor, hidden: List[torch.Tensor], cell: List[torch.Tensor]):
+    def forward(self, grad_vec: torch.Tensor, hidden, cell):
         if self.preproc:
-            grad = self._preprocess(grad)
+            x = self._preprocess(grad_vec)  # [N,2]
+        else:
+            x = grad_vec.detach()  # [N,1]
 
-        h0, c0 = self.lstm1(grad, (hidden[0], cell[0]))
+        h0, c0 = self.lstm1(x, (hidden[0], cell[0]))
         h1, c1 = self.lstm2(h0, (hidden[1], cell[1]))
-
-        update = self.out(h1)  # no tanh
+        update = self.out(h1)  # [N,1] (no tanh)
         return update, (h0, h1), (c0, c1)
 
 
-# ---------------------- helpers ----------------------
-def _count_params_from_optimizee(optimizee: MLPOptimizee) -> int:
-    return int(sum(p.numel() for _, p in optimizee.all_named_parameters()))
+def flatten_like_params(tensors, params):
+    """Concatenate list of tensors shaped like params into a single [N,1] vector."""
+    vecs = []
+    for t, p in zip(tensors, params):
+        if t is None:
+            vecs.append(torch.zeros(p.numel(), device=p.device, dtype=p.dtype))
+        else:
+            vecs.append(t.reshape(-1))
+    return torch.cat(vecs, dim=0).view(-1, 1)  # [N,1]
+
+
+def unflatten_to_params(vec: torch.Tensor, params):
+    """Split [N,1] vector into list of tensors shaped like params."""
+    outs = []
+    offset = 0
+    v = vec.view(-1)
+    for p in params:
+        sz = p.numel()
+        outs.append(v[offset:offset + sz].view_as(p))
+        offset += sz
+    return outs
 
 
 @torch.no_grad()
-def eval_params_on_dataset(
-    params: Dict[str, torch.Tensor],
-    x_np: np.ndarray,
-    y_np: np.ndarray,
-    batch_size: int = 512,
-) -> Tuple[float, float]:
-    device = get_device()
-    x = torch.from_numpy(np.asarray(x_np, dtype=np.float32)).to(device)
-    y = torch.from_numpy(np.asarray(y_np, dtype=np.int64)).to(device)
-
-    n = x.size(0)
-    total_loss = 0.0
-    total_correct = 0
+def eval_model(net: nn.Module, data_loader, device, ce):
+    net.eval()
+    losses = []
+    correct = 0
     total = 0
-
-    for i in range(0, n, batch_size):
-        xb = x[i:i + batch_size]
-        yb = y[i:i + batch_size]
-
-        h = torch.sigmoid(xb @ params["W1"] + params["b1"])
-        logits = h @ params["W2"] + params["b2"]
-
-        loss = F.cross_entropy(logits, yb, reduction="sum")
-        total_loss += float(loss.item())
-        total_correct += int((logits.argmax(dim=1) == yb).sum().item())
-        total += int(yb.size(0))
-
-    return total_loss / max(total, 1), total_correct / max(total, 1)
-
-
-def run_inner_trajectory_get_final_params(
-    opt_net: LearnedOptimizer,
-    x_train: np.ndarray,
-    y_train: np.ndarray,
-    optim_steps: int,
-    out_mul: float,
-    batch_size: int,
-    task_seed: int,
-    init_scale: float,
-    hidden_dim: int,
-    task_subsample_frac: float,
-) -> Dict[str, torch.Tensor]:
-    """
-    Run optimizee training for optim_steps using learned optimizer (no meta-grad),
-    return final params dict.
-    """
-    device = get_device()
-    opt_net.eval()
-
-    task = MNIST1DTask(
-        x_train, y_train,
-        batch_size=batch_size,
-        task_seed=task_seed,
-        drop_last=True,
-        subsample_frac=task_subsample_frac,
-    )
-
-    optimizee = MLPOptimizee(hidden_dim=hidden_dim, init_scale=init_scale)
-    params = {k: v for k, v in optimizee.params.items()}
-
-    n_params = int(sum(p.numel() for p in params.values()))
-    hidden = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
-    cell = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
-
-    for _ in range(optim_steps):
-        xb, yb = task.sample()
+    for xb, yb in data_loader:
         xb = xb.to(device)
         yb = yb.to(device)
-
-        h = torch.sigmoid(xb @ params["W1"] + params["b1"])
-        logits = h @ params["W2"] + params["b2"]
-        loss = F.cross_entropy(logits, yb)
-
-        grads = torch.autograd.grad(
-            loss,
-            list(params.values()),
-            create_graph=False,
-            retain_graph=False,
-            allow_unused=False,
-        )
-
-        offset = 0
-        new_params: Dict[str, torch.Tensor] = {}
-        new_hidden = [torch.zeros_like(hh) for hh in hidden]
-        new_cell = [torch.zeros_like(cc) for cc in cell]
-
-        for (name, p), g in zip(params.items(), grads):
-            sz = p.numel()
-            grad_vec = g.detach().reshape(sz, 1)
-
-            update, h_new, c_new = opt_net(
-                grad_vec,
-                [hh[offset:offset + sz] for hh in hidden],
-                [cc[offset:offset + sz] for cc in cell],
-            )
-
-            for i in range(2):
-                new_hidden[i][offset:offset + sz] = h_new[i].detach()
-                new_cell[i][offset:offset + sz] = c_new[i].detach()
-
-            new_p = (p + out_mul * update.view_as(p)).detach()
-            new_params[name] = detach_var(new_p)
-            offset += sz
-
-        params = new_params
-        hidden = new_hidden
-        cell = new_cell
-
-    return params
-
-
-# ---------------------- Meta-training (truncated BPTT) ----------------------
-def do_fit(
-    opt_net: LearnedOptimizer,
-    meta_opt: Optional[optim.Optimizer],
-    x: np.ndarray,
-    y: np.ndarray,
-    task_seed: int,
-    optim_steps: int = 100,
-    unroll: int = 20,
-    out_mul: float = 0.1,
-    training: bool = True,
-    batch_size: int = 128,
-    init_scale: float = 1e-3,
-    hidden_dim: int = 20,
-    task_subsample_frac: float = 1.0,
-    meta_clip_norm: float = 1.0,
-) -> List[float]:
-    """
-    One optimizee trajectory. Returns per-step optimizee losses.
-
-    FIXED semantics:
-      - Per-step gradients are computed via torch.autograd.grad (NO loss.backward for grads).
-      - Meta-loss backward happens ONLY at unroll boundaries (NO "backward then backward").
-    """
-    device = get_device()
-    if training:
-        opt_net.train()
-    else:
-        opt_net.eval()
-        unroll = 1  # evaluation: no truncated BPTT segments
-
-    task = MNIST1DTask(
-        x, y,
-        batch_size=batch_size,
-        task_seed=task_seed,
-        drop_last=True,
-        subsample_frac=task_subsample_frac,
-    )
-
-    optimizee = MLPOptimizee(hidden_dim=hidden_dim, init_scale=init_scale)
-    n_params = _count_params_from_optimizee(optimizee)
-
-    # hidden/cell are coordinate-wise states, shape [num_params, hidden_sz]
-    hidden = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
-    cell = [torch.zeros(n_params, opt_net.hidden_sz, device=device) for _ in range(2)]
-
-    if training and meta_opt is not None:
-        meta_opt.zero_grad(set_to_none=True)
-
-    total_loss: Optional[torch.Tensor] = None
-    losses_ever: List[float] = []
-
-    for step in range(1, optim_steps + 1):
-        # ---- forward loss ----
-        loss = optimizee(task)
-        losses_ever.append(float(loss.item()))
-        total_loss = loss if total_loss is None else (total_loss + loss)
-
-        # ---- per-step grads: autograd.grad (NOT backward) ----
-        param_items = optimizee.all_named_parameters()
-        param_list = [p for _, p in param_items]
-
-        # retain_graph is needed in training because we will backward(total_loss) later at unroll boundary
-        grads = torch.autograd.grad(
-            loss,
-            param_list,
-            create_graph=False,              # paper/common ref: do not backprop through grads
-            retain_graph=bool(training),     # keep graph until meta backward
-            allow_unused=False,
-        )
-
-        # ---- apply learned optimizer update ----
-        offset = 0
-        new_params: Dict[str, torch.Tensor] = {}
-        new_hidden = [torch.zeros_like(hh) for hh in hidden]
-        new_cell = [torch.zeros_like(cc) for cc in cell]
-
-        for (name, p), g in zip(param_items, grads):
-            sz = p.numel()
-
-            # gradient input is detached (paper/common ref); meta-grad flows through opt_net params via update
-            grad_in = g.detach().reshape(sz, 1)
-
-            update, h_new, c_new = opt_net(
-                grad_in,
-                [hh[offset:offset + sz] for hh in hidden],
-                [cc[offset:offset + sz] for cc in cell],
-            )
-
-            for i in range(2):
-                new_hidden[i][offset:offset + sz] = h_new[i]
-                new_cell[i][offset:offset + sz] = c_new[i]
-
-            new_p = p + out_mul * update.view_as(p)
-            new_params[name] = new_p
-            offset += sz
-
-        # ---- unroll boundary: do ONE meta backward and step ----
-        if step % unroll == 0:
-            if training and meta_opt is not None:
-                meta_opt.zero_grad(set_to_none=True)
-                assert total_loss is not None
-                total_loss.backward()
-
-                if meta_clip_norm is not None and float(meta_clip_norm) > 0:
-                    torch.nn.utils.clip_grad_norm_(opt_net.parameters(), max_norm=float(meta_clip_norm))
-
-                meta_opt.step()
-
-            # truncate BPTT: detach params + states into fresh leaves for next segment
-            if training:
-                optimizee = MLPOptimizee(
-                    hidden_dim=hidden_dim,
-                    init_scale=init_scale,
-                    params={k: detach_var(v) for k, v in new_params.items()},
-                )
-                hidden = [hh.detach() for hh in new_hidden]
-                cell = [cc.detach() for cc in new_cell]
-            else:
-                # eval: always detach each step/segment
-                optimizee = MLPOptimizee(
-                    hidden_dim=hidden_dim,
-                    init_scale=init_scale,
-                    params={k: detach_var(v.detach()) for k, v in new_params.items()},
-                )
-                hidden = [hh.detach() for hh in new_hidden]
-                cell = [cc.detach() for cc in new_cell]
-
-            total_loss = None
-        else:
-            # within unroll: keep graph
-            if training:
-                optimizee = MLPOptimizee(hidden_dim=hidden_dim, init_scale=init_scale, params=new_params)
-                hidden = new_hidden
-                cell = new_cell
-            else:
-                # eval: we set unroll=1 above, so should not reach here
-                optimizee = MLPOptimizee(
-                    hidden_dim=hidden_dim,
-                    init_scale=init_scale,
-                    params={k: detach_var(v.detach()) for k, v in new_params.items()},
-                )
-                hidden = [hh.detach() for hh in new_hidden]
-                cell = [cc.detach() for cc in new_cell]
-
-    return losses_ever
-
-
-# ---------------------- Outer loop + logging ----------------------
-def train_l2lgdgd(args, run_dir: Path):
-    device = get_device()
-    set_seed(args.seed)
-
-    opt_net = LearnedOptimizer(hidden_sz=args.hidden_sz, preproc=(not args.no_preproc)).to(device)
-    meta_opt = optim.Adam(opt_net.parameters(), lr=args.lr)
-
-    # Load base MNIST1D
-    (xtr, ytr), (xte, yte) = load_mnist1d(length=40, seed=args.data_seed)
-    xtr = _to_N40(xtr).astype(np.float32)
-    xte = _to_N40(xte).astype(np.float32)
-    ytr = np.asarray(ytr, dtype=np.int64)
-    yte = np.asarray(yte, dtype=np.int64)
-
-    # Apply preprocess split+norm (to align with baselines/F*)
-    if args.preprocess_dir is not None:
-        split, mean, std = load_split_and_norm(Path(args.preprocess_dir), args.data_seed)
-        train_idx = np.asarray(split["train_idx"], dtype=np.int64)
-        val_idx = np.asarray(split["val_idx"], dtype=np.int64)
-
-        x_train = apply_norm(xtr[train_idx], mean, std)
-        y_train = ytr[train_idx]
-        x_val = apply_norm(xtr[val_idx], mean, std)
-        y_val = ytr[val_idx]
-        x_test = apply_norm(xte, mean, std)
-        y_test = yte
-    else:
-        x_train, y_train = xtr, ytr
-        x_val, y_val = xtr[:0], ytr[:0]
-        x_test, y_test = xte, yte
-
-    best_eval_meta_loss = float("inf")
-    best_state = None
-
-    train_log_path = run_dir / "train_log.csv"
-    curve_eval_path = run_dir / "curve_eval_mean.csv"
-
-    with open(train_log_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "meta_epoch",
-            "elapsed_sec",
-            "eval_meta_loss",
-            "report_train_loss",
-            "report_train_acc",
-            "report_val_loss",
-            "report_val_acc",
-            "report_test_loss",
-            "report_test_acc",
-        ])
-
-    with open(curve_eval_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["meta_epoch", "step", "loss_mean"])
-
-    rng = np.random.RandomState(args.seed)
-
-    def sample_task_seed(low: int, high: int) -> int:
-        return int(rng.randint(low, high + 1))
-
-    for ep in range(args.meta_epochs):
-        # ---- meta-train ----
-        for _ in range(args.inner_loops_per_epoch):
-            task_seed = sample_task_seed(args.train_seed_low, args.train_seed_high)
-            do_fit(
-                opt_net=opt_net,
-                meta_opt=meta_opt,
-                x=x_train,
-                y=y_train,
-                task_seed=task_seed,
-                optim_steps=args.optim_steps,
-                unroll=args.unroll,
-                out_mul=args.out_mul,
-                training=True,
-                batch_size=args.bs,
-                init_scale=args.init_scale,
-                hidden_dim=args.hidden_dim,
-                task_subsample_frac=args.task_subsample_frac,
-                meta_clip_norm=args.meta_clip_norm,
-            )
-
-        # ---- meta-eval loss curve on held-out task seeds ----
-        eval_trajs = []
-        for _ in range(args.eval_tasks):
-            task_seed = sample_task_seed(args.eval_seed_low, args.eval_seed_high)
-            traj = do_fit(
-                opt_net=opt_net,
-                meta_opt=None,
-                x=x_train,
-                y=y_train,
-                task_seed=task_seed,
-                optim_steps=args.optim_steps,
-                unroll=args.unroll,
-                out_mul=args.out_mul,
-                training=False,
-                batch_size=args.bs,
-                init_scale=args.init_scale,
-                hidden_dim=args.hidden_dim,
-                task_subsample_frac=args.task_subsample_frac,
-                meta_clip_norm=args.meta_clip_norm,
-            )
-            eval_trajs.append(traj)
-
-        eval_meta_loss = float(np.mean([sum(t) for t in eval_trajs]))
-
-        traj_arr = np.asarray(eval_trajs, dtype=np.float32)  # [eval_tasks, steps]
-        mean_curve = traj_arr.mean(axis=0)
-
-        with open(curve_eval_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            for s, lv in enumerate(mean_curve, start=1):
-                writer.writerow([ep, s, float(lv)])
-
-        # ---- report optimizee performance ----
-        rep_train_losses, rep_train_accs = [], []
-        rep_val_losses, rep_val_accs = [], []
-        rep_test_losses, rep_test_accs = [], []
-
-        for _ in range(args.report_tasks):
-            task_seed = sample_task_seed(args.eval_seed_low, args.eval_seed_high)
-            final_params = run_inner_trajectory_get_final_params(
-                opt_net=opt_net,
-                x_train=x_train,
-                y_train=y_train,
-                optim_steps=args.optim_steps,
-                out_mul=args.out_mul,
-                batch_size=args.bs,
-                task_seed=task_seed,
-                init_scale=args.init_scale,
-                hidden_dim=args.hidden_dim,
-                task_subsample_frac=args.task_subsample_frac,
-            )
-
-            tr_loss, tr_acc = eval_params_on_dataset(final_params, x_train, y_train, batch_size=512)
-            te_loss, te_acc = eval_params_on_dataset(final_params, x_test, y_test, batch_size=512)
-            rep_train_losses.append(tr_loss)
-            rep_train_accs.append(tr_acc)
-            rep_test_losses.append(te_loss)
-            rep_test_accs.append(te_acc)
-
-            if x_val.shape[0] > 0:
-                va_loss, va_acc = eval_params_on_dataset(final_params, x_val, y_val, batch_size=512)
-                rep_val_losses.append(va_loss)
-                rep_val_accs.append(va_acc)
-
-        report_train_loss = float(np.mean(rep_train_losses))
-        report_train_acc = float(np.mean(rep_train_accs))
-        report_test_loss = float(np.mean(rep_test_losses))
-        report_test_acc = float(np.mean(rep_test_accs))
-
-        if x_val.shape[0] > 0:
-            report_val_loss = float(np.mean(rep_val_losses))
-            report_val_acc = float(np.mean(rep_val_accs))
-        else:
-            report_val_loss = float("nan")
-            report_val_acc = float("nan")
-
-        elapsed = time.time() - args._start_time
-
-        print(
-            f"[MetaEpoch {ep:03d}] "
-            f"eval_meta_loss={eval_meta_loss:.6f} "
-            f"train_loss={report_train_loss:.4f} train_acc={report_train_acc:.4f} "
-            f"val_loss={report_val_loss:.4f} val_acc={report_val_acc:.4f} "
-            f"test_loss={report_test_loss:.4f} test_acc={report_test_acc:.4f}"
-        )
-
-        with open(train_log_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                ep,
-                f"{elapsed:.3f}",
-                f"{eval_meta_loss:.8f}",
-                f"{report_train_loss:.8f}",
-                f"{report_train_acc:.6f}",
-                f"{report_val_loss:.8f}",
-                f"{report_val_acc:.6f}",
-                f"{report_test_loss:.8f}",
-                f"{report_test_acc:.6f}",
-            ])
-
-        if args.wandb and wandb is not None:
-            wandb.log({
-                "meta_epoch": ep,
-                "eval_meta_loss": eval_meta_loss,
-                "report/train_loss": report_train_loss,
-                "report/train_acc": report_train_acc,
-                "report/val_loss": report_val_loss,
-                "report/val_acc": report_val_acc,
-                "report/test_loss": report_test_loss,
-                "report/test_acc": report_test_acc,
-                "time/elapsed_sec": elapsed,
-                "eval_curve/auc_sum": float(mean_curve.sum()),
-            })
-
-        if eval_meta_loss < best_eval_meta_loss:
-            best_eval_meta_loss = eval_meta_loss
-            best_state = copy.deepcopy(opt_net.state_dict())
-            torch.save(best_state, run_dir / "best_opt.pt")
-
-    result = {
-        "method": "mnist1d_l2lgdgd_mlp",
-        "optimizee": f"MLP(40->{args.hidden_dim}(sigmoid)->10)",
-        "seed": int(args.seed),
-        "data_seed": int(args.data_seed),
-        "meta_epochs": int(args.meta_epochs),
-        "inner_loops_per_epoch": int(args.inner_loops_per_epoch),
-        "eval_tasks": int(args.eval_tasks),
-        "report_tasks": int(args.report_tasks),
-        "optim_steps": int(args.optim_steps),
-        "unroll": int(args.unroll),
-        "lr": float(args.lr),
-        "bs": int(args.bs),
-        "out_mul": float(args.out_mul),
-        "init_scale": float(args.init_scale),
-        "hidden_sz": int(args.hidden_sz),
-        "hidden_dim": int(args.hidden_dim),
-        "preproc": bool(not args.no_preproc),
-        "preprocess_dir": (str(args.preprocess_dir) if args.preprocess_dir is not None else None),
-        "task_subsample_frac": float(args.task_subsample_frac),
-        "meta_clip_norm": float(args.meta_clip_norm),
-        "train_seed_low": int(args.train_seed_low),
-        "train_seed_high": int(args.train_seed_high),
-        "eval_seed_low": int(args.eval_seed_low),
-        "eval_seed_high": int(args.eval_seed_high),
-        "best_eval_meta_loss": float(best_eval_meta_loss),
-        "device": str(device),
-        "run_dir": str(run_dir),
-        "checkpoint": str(run_dir / "best_opt.pt"),
-        "artifacts": {
-            "train_log": str(train_log_path),
-            "curve_eval_mean": str(curve_eval_path),
-        },
-    }
-    with open(run_dir / "result.json", "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
-
-    return best_eval_meta_loss, best_state
-
-
-def build_argparser():
-    ap = argparse.ArgumentParser()
-
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--data_seed", type=int, default=42)
-
-    ap.add_argument("--meta_epochs", type=int, default=50)
-    ap.add_argument("--inner_loops_per_epoch", type=int, default=20)
-    ap.add_argument("--eval_tasks", type=int, default=10)
-    ap.add_argument("--report_tasks", type=int, default=3)
-
-    ap.add_argument("--optim_steps", type=int, default=100)
-    ap.add_argument("--unroll", type=int, default=20)
-
-    ap.add_argument("--lr", type=float, default=3e-3)
-    ap.add_argument("--bs", type=int, default=128)
-    ap.add_argument("--out_mul", type=float, default=0.1)
-
-    ap.add_argument("--init_scale", type=float, default=1e-3)
-    ap.add_argument("--hidden_dim", type=int, default=20)
-
-    ap.add_argument("--hidden_sz", type=int, default=20)
-    ap.add_argument("--no_preproc", action="store_true")
-
-    ap.add_argument(
-        "--preprocess_dir",
-        type=str,
-        default="artifacts/preprocess",
-        help="Loads split.json + norm.json under {preprocess_dir}/seed_{data_seed}/.",
-    )
-
-    ap.add_argument("--task_subsample_frac", type=float, default=1.0)
-    ap.add_argument("--meta_clip_norm", type=float, default=5.0)
-
-    ap.add_argument("--train_seed_low", type=int, default=0)
-    ap.add_argument("--train_seed_high", type=int, default=9999)
-    ap.add_argument("--eval_seed_low", type=int, default=10000)
-    ap.add_argument("--eval_seed_high", type=int, default=10999)
-
-    ap.add_argument("--runs_dir", type=str, default="runs")
-
-    ap.add_argument("--wandb", action="store_true")
-    ap.add_argument("--wandb_project", type=str, default="l2o-online")
-    ap.add_argument("--wandb_group", type=str, default="mnist1d_l2lgdgd_mlp")
-    ap.add_argument("--wandb_run_name", type=str, default=None)
-
-    return ap
-
+        logits = net(xb)
+        loss = ce(logits, yb)
+        losses.append(float(loss.item()))
+        pred = logits.argmax(dim=1)
+        correct += int((pred == yb).sum().item())
+        total += int(yb.size(0))
+    return (float(np.mean(losses)) if losses else float("nan"), correct / max(total, 1))
+
+
+# ------------------------------ Main ------------------------------
 
 def main():
-    args = build_argparser().parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--length", type=int, default=40)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--data_seed", type=int, default=42)
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--bs", type=int, default=128)
+    ap.add_argument("--preprocess_dir", type=str, default="artifacts/preprocess")
 
-    print(f"[INFO] device = {get_device()}")
+    # Backbone (align with your MLP F-scripts)
+    ap.add_argument("--mlp_width", type=int, default=128)
+    ap.add_argument("--mlp_layers", type=int, default=5)
+    ap.add_argument("--activation", type=str, default="relu")
+
+    # Learned optimizer hyperparameters
+    ap.add_argument("--opt_hidden_sz", type=int, default=20)
+    ap.add_argument("--opt_lr", type=float, default=1e-3, help="online meta LR for optimizer params")
+    ap.add_argument("--out_mul", type=float, default=0.1, help="scale applied to optimizer output update")
+    ap.add_argument("--no_preproc", action="store_true")
+    ap.add_argument("--preproc_factor", type=float, default=10.0)
+
+    # Clipping (align spirit with your F scripts)
+    ap.add_argument("--clip_update", type=float, default=1.0, help="global-norm clip on Δw (0 disables)")
+    ap.add_argument("--reg_update", type=float, default=1e-6, help="L2 reg on update_vec mean-square")
+
+    # WandB
+    ap.add_argument("--wandb", action="store_true")
+    ap.add_argument("--wandb_project", type=str, default="l2o-mnist1d")
+    ap.add_argument("--wandb_group", type=str, default="mnist1d_mlp_l2l_online")
+    ap.add_argument("--wandb_run_name", type=str, default=None)
+
+    args = ap.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] device = {device}")
+    set_seed(args.seed)
 
     run_name = (
-        f"mnist1d_l2lgdgd_mlp_seed{args.seed}_data{args.data_seed}_"
-        f"sub{args.task_subsample_frac}_clip{args.meta_clip_norm}_"
-        f"steps{args.optim_steps}_unroll{args.unroll}_"
-        f"lr{args.lr}_out{args.out_mul}_initscale{args.init_scale}_"
-        f"hd{args.hidden_dim}_"
+        f"mnist1d_mlp_l2l_online_data{args.data_seed}_seed{args.seed}_"
+        f"L{args.mlp_layers}_W{args.mlp_width}_"
+        f"hs{args.opt_hidden_sz}_lr{args.opt_lr}_out{args.out_mul}_"
         + datetime.now().strftime("%Y%m%d-%H%M%S")
     )
-    run_dir = Path(args.runs_dir) / run_name
+    run_dir = Path("runs") / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] run_dir = {run_dir}")
 
-    args._start_time = time.time()
-
+    # ---------------- WandB init (optional) ----------------
     wandb_run = None
     if args.wandb:
         if wandb is None:
-            raise RuntimeError("wandb is not installed but --wandb was passed.")
+            raise RuntimeError("wandb is not installed, but --wandb was passed.")
         wandb_run = wandb.init(
             project=args.wandb_project,
             group=args.wandb_group,
@@ -846,20 +324,271 @@ def main():
             config=vars(args),
         )
 
-    best_loss, _ = train_l2lgdgd(args, run_dir)
-    elapsed = time.time() - args._start_time
-    print(f"[DONE] best eval_meta_loss={best_loss:.6f} elapsed={elapsed/60:.2f} min")
+    # ---------------- data (align with F scripts) ----------------
+    (xtr, ytr), (xte, yte) = load_mnist1d(length=args.length, seed=args.data_seed)
+
+    xtr = to_NL(xtr, length=args.length).astype(np.float32, copy=False)
+    xte = to_NL(xte, length=args.length).astype(np.float32, copy=False)
+    ytr = np.asarray(ytr, dtype=np.int64)
+    yte = np.asarray(yte, dtype=np.int64)
+
+    split, norm = load_artifacts(Path(args.preprocess_dir), seed=args.data_seed)
+    mean = np.array(norm["mean"], np.float32)
+    std = np.array(norm["std"], np.float32)
+    train_idx = np.array(split["train_idx"], dtype=np.int64)
+    val_idx = np.array(split["val_idx"], dtype=np.int64)
+
+    x_train = apply_norm_np(xtr[train_idx], mean, std)
+    y_train = ytr[train_idx]
+    x_val = apply_norm_np(xtr[val_idx], mean, std)
+    y_val = ytr[val_idx]
+    x_test = apply_norm_np(xte, mean, std)
+    y_test = yte
+
+    x_train_t = torch.from_numpy(x_train)
+    y_train_t = torch.from_numpy(y_train)
+    x_val_t = torch.from_numpy(x_val)
+    y_val_t = torch.from_numpy(y_val)
+    x_test_t = torch.from_numpy(x_test)
+    y_test_t = torch.from_numpy(y_test)
+
+    train_loader = DataLoader(TensorDataset(x_train_t, y_train_t), batch_size=args.bs, shuffle=True, drop_last=True)
+    val_loader = DataLoader(TensorDataset(x_val_t, y_val_t), batch_size=args.bs, shuffle=True, drop_last=True)
+
+    def infinite_loader(loader):
+        while True:
+            for b in loader:
+                yield b
+
+    val_iter = infinite_loader(val_loader)
+
+    val_eval_loader = DataLoader(TensorDataset(x_val_t, y_val_t), batch_size=512, shuffle=False)
+    test_eval_loader = DataLoader(TensorDataset(x_test_t, y_test_t), batch_size=512, shuffle=False)
+
+    # ---------------- models ----------------
+    net = build_mlp(
+        input_len=args.length,
+        num_layers=args.mlp_layers,
+        width=args.mlp_width,
+        activation=args.activation,
+    ).to(device)
+
+    opt_net = LearnedOptimizer(
+        hidden_sz=args.opt_hidden_sz,
+        preproc=(not args.no_preproc),
+        preproc_factor=args.preproc_factor,
+    ).to(device)
+
+    meta_opt = torch.optim.Adam(opt_net.parameters(), lr=args.opt_lr)
+    ce = nn.CrossEntropyLoss()
+
+    params = list(net.parameters())
+
+    # coordinate-wise hidden/cell: [N, hidden_sz]
+    n_params = int(sum(p.numel() for p in params))
+    hidden = [torch.zeros(n_params, args.opt_hidden_sz, device=device) for _ in range(2)]
+    cell = [torch.zeros(n_params, args.opt_hidden_sz, device=device) for _ in range(2)]
+
+    # ---------------- logs ----------------
+    curve_logger = BatchLossLogger(
+        run_dir,
+        meta={"method": "l2l_lstm_online_mnist1d_mlp", "seed": args.seed, "opt": "lstm_opt", "lr": args.opt_lr},
+        filename="curve_l2l.csv",
+    )
+    mech_path = run_dir / "mechanism_l2l.csv"
+    train_log_path = run_dir / "train_log_l2l.csv"
+    result_path = run_dir / "result_l2l.json"
+
+    with open(mech_path, "w") as f:
+        f.write("iter,epoch,train_loss,val_dot,update_norm,grad_norm\n")
+    with open(train_log_path, "w") as f:
+        f.write("epoch,elapsed_sec,train_loss,val_loss,test_loss,val_acc,test_acc\n")
+
+    global_step = 0
+    start_time = time.time()
+
+    # ---------------- training loop ----------------
+    for epoch in range(args.epochs):
+        epoch_start = time.time()
+        curve_logger.on_epoch_begin(epoch)
+
+        net.train()
+        opt_net.train()
+
+        train_loss_sum = 0.0
+        train_batches = 0
+
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            # --- train loss + grad ---
+            logits = net(xb)
+            train_loss = ce(logits, yb)
+            train_loss_sum += float(train_loss.item())
+            train_batches += 1
+
+            grads = torch.autograd.grad(train_loss, params, create_graph=False, retain_graph=False, allow_unused=False)
+            g_vec = flatten_like_params(grads, params)  # [N,1]
+
+            # --- proposal update from current optimizer ---
+            update_vec_1, h_new_1, c_new_1 = opt_net(g_vec, hidden, cell)  # update depends on opt_net params
+            delta_list_1 = unflatten_to_params(update_vec_1 * args.out_mul, params)
+
+            # --- val grad ---
+            xv, yv = next(val_iter)
+            xv = xv.to(device)
+            yv = yv.to(device)
+            val_logits = net(xv)
+            val_loss = ce(val_logits, yv)
+            grad_val = torch.autograd.grad(val_loss, params, create_graph=False, retain_graph=False, allow_unused=False)
+
+            # dot = <grad_val(stop), Δw(phi)>
+            dot = torch.zeros([], device=device, dtype=torch.float32)
+            for gv, dw in zip(grad_val, delta_list_1):
+                dot = dot + (gv.detach().float() * dw.float()).sum()
+
+            # meta objective: maximize dot => minimize -dot
+            meta_loss = -dot
+            if args.reg_update is not None and float(args.reg_update) > 0.0:
+                meta_loss = meta_loss + float(args.reg_update) * torch.mean(update_vec_1.pow(2))
+
+            meta_opt.zero_grad(set_to_none=True)
+            meta_loss.backward()
+            meta_opt.step()
+
+            # --- apply update using UPDATED optimizer params ---
+            with torch.no_grad():
+                update_vec_2, h_new_2, c_new_2 = opt_net(g_vec, hidden, cell)
+                delta_vec = update_vec_2 * args.out_mul  # [N,1]
+
+                # clip Δw global norm if requested
+                if args.clip_update is not None and float(args.clip_update) > 0.0:
+                    upd_norm = torch.sqrt(torch.sum(delta_vec.view(-1) ** 2) + 1e-12)
+                    coef = min(1.0, float(args.clip_update) / float(upd_norm.item()))
+                    delta_vec.mul_(coef)
+                else:
+                    upd_norm = torch.sqrt(torch.sum(delta_vec.view(-1) ** 2) + 1e-12)
+
+                # apply to params
+                delta_list = unflatten_to_params(delta_vec, params)
+                for p, dw in zip(params, delta_list):
+                    p.add_(dw.to(p.dtype))
+
+                # update optimizer state (carry across steps, but detach)
+                hidden = [h.detach() for h in h_new_2]
+                cell = [c.detach() for c in c_new_2]
+
+                # log mechanism
+                g_norm = torch.sqrt(torch.sum(g_vec.view(-1) ** 2) + 1e-12)
+
+                with open(mech_path, "a") as f:
+                    f.write(
+                        f"{global_step},{epoch},"
+                        f"{float(train_loss.item()):.8f},"
+                        f"{float(dot.item()):.8f},"
+                        f"{float(upd_norm.item()):.6g},"
+                        f"{float(g_norm.item()):.6g}\n"
+                    )
+
+            curve_logger.on_train_batch_end(float(train_loss.item()))
+            global_step += 1
+
+        # --- epoch eval ---
+        train_loss_epoch = train_loss_sum / max(train_batches, 1)
+        val_loss_epoch, val_acc = eval_model(net, val_eval_loader, device, ce)
+        test_loss_epoch, test_acc = eval_model(net, test_eval_loader, device, ce)
+
+        total_elapsed = time.time() - start_time
+        epoch_elapsed = time.time() - epoch_start
+
+        with open(train_log_path, "a") as f:
+            f.write(
+                f"{epoch},{total_elapsed:.3f},"
+                f"{train_loss_epoch:.8f},"
+                f"{val_loss_epoch:.8f},"
+                f"{test_loss_epoch:.8f},"
+                f"{val_acc:.6f},"
+                f"{test_acc:.6f}\n"
+            )
+
+        print(
+            f"[MNIST1D-MLP-L2L-ONLINE EPOCH {epoch}] "
+            f"time={epoch_elapsed:.2f}s total={total_elapsed/60:.2f}min "
+            f"train={train_loss_epoch:.4f} "
+            f"val={val_loss_epoch:.4f} test={test_loss_epoch:.4f} "
+            f"val_acc={val_acc:.4f} test_acc={test_acc:.4f}"
+        )
+
+        if wandb_run is not None:
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss_epoch,
+                    "val_loss": val_loss_epoch,
+                    "test_loss": test_loss_epoch,
+                    "val_acc": val_acc,
+                    "test_acc": test_acc,
+                    "time/epoch_sec": epoch_elapsed,
+                    "time/total_sec": total_elapsed,
+                }
+            )
+
+    curve_logger.on_train_end()
+    total_time = time.time() - start_time
+
+    # final test
+    net.eval()
+    with torch.no_grad():
+        logits_test = net(x_test_t.to(device))
+        final_test_loss = ce(logits_test, y_test_t.to(device)).item()
+        final_test_acc = (logits_test.argmax(dim=1) == y_test_t.to(device)).float().mean().item()
+
+    print(
+        f"[RESULT-MNIST1D-MLP-L2L-ONLINE] TestAcc={final_test_acc:.4f} "
+        f"TestLoss={final_test_loss:.4f} (Total time={total_time/60:.2f} min)"
+    )
+
+    result = {
+        "dataset": f"MNIST-1D(len={args.length})",
+        "backbone": "MLP",
+        "method": "l2l_coordinatewise_lstm_online_firstorder",
+        "epochs": int(args.epochs),
+        "bs": int(args.bs),
+        "seed": int(args.seed),
+        "data_seed": int(args.data_seed),
+        "test_acc": float(final_test_acc),
+        "test_loss": float(final_test_loss),
+        "elapsed_sec": float(total_time),
+        "run_dir": str(run_dir),
+        "preprocess": str(Path(args.preprocess_dir) / f"seed_{args.data_seed}"),
+        "hparams": {
+            "mlp_width": args.mlp_width,
+            "mlp_layers": args.mlp_layers,
+            "activation": args.activation,
+            "opt_hidden_sz": args.opt_hidden_sz,
+            "opt_lr": args.opt_lr,
+            "out_mul": args.out_mul,
+            "preproc": bool(not args.no_preproc),
+            "preproc_factor": args.preproc_factor,
+            "clip_update": args.clip_update,
+            "reg_update": args.reg_update,
+        },
+        "logs": {
+            "curve": str(curve_logger.curve_path),
+            "mechanism": str(mech_path),
+            "train_log": str(train_log_path),
+        },
+    }
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
 
     if wandb_run is not None:
-        wandb_run.summary["best_eval_meta_loss"] = float(best_loss)
-        wandb_run.summary["elapsed_sec"] = float(elapsed)
-        for p in [
-            run_dir / "train_log.csv",
-            run_dir / "curve_eval_mean.csv",
-            run_dir / "result.json",
-            run_dir / "best_opt.pt",
-        ]:
-            if p.exists():
+        wandb_run.summary["final_test_acc"] = float(final_test_acc)
+        wandb_run.summary["final_test_loss"] = float(final_test_loss)
+        wandb_run.summary["total_time_sec"] = float(total_time)
+        for p in [curve_logger.curve_path, mech_path, train_log_path, result_path]:
+            if Path(p).exists():
                 wandb.save(str(p))
         wandb_run.finish()
 

@@ -36,9 +36,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import TensorDataset
 
 from data_mnist1d import load_mnist1d
+from loader_utils import LoaderCfg, make_train_val_loaders, make_eval_loader
 
 # Optional wandb
 try:
@@ -362,33 +363,32 @@ def main():
     x_val_raw, y_val = xtr[val_idx], ytr[val_idx]
     x_test_raw, y_test = xte, yte
 
-    x_train = apply_norm_np(x_train_raw, mean, std)
-    x_val = apply_norm_np(x_val_raw, mean, std)
-    x_test = apply_norm_np(x_test_raw, mean, std)
+    x_train = apply_norm_np(x_train_raw, mean, std).astype(np.float32, copy=False)
+    x_val = apply_norm_np(x_val_raw, mean, std).astype(np.float32, copy=False)
+    x_test = apply_norm_np(x_test_raw, mean, std).astype(np.float32, copy=False)
 
     # MLP expects [N, length]
-    x_train_t = torch.from_numpy(x_train)
-    x_val_t = torch.from_numpy(x_val)
-    x_test_t = torch.from_numpy(x_test)
-    y_train_t = torch.from_numpy(y_train)
-    y_val_t = torch.from_numpy(y_val)
-    y_test_t = torch.from_numpy(y_test)
+    x_train_t = torch.from_numpy(x_train).to(dtype=torch.float32)
+    x_val_t = torch.from_numpy(x_val).to(dtype=torch.float32)
+    x_test_t = torch.from_numpy(x_test).to(dtype=torch.float32)
+    y_train_t = torch.from_numpy(y_train).to(dtype=torch.long)
+    y_val_t = torch.from_numpy(y_val).to(dtype=torch.long)
+    y_test_t = torch.from_numpy(y_test).to(dtype=torch.long)
 
     train_dataset = TensorDataset(x_train_t, y_train_t)
     val_dataset = TensorDataset(x_val_t, y_val_t)
     test_dataset = TensorDataset(x_test_t, y_test_t)
 
-    train_loader = DataLoader(
+    cfg = LoaderCfg(batch_size=args.bs, num_workers=0)
+    train_loader, val_loader = make_train_val_loaders(
         train_dataset,
-        batch_size=args.bs,
-        shuffle=True,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
         val_dataset,
-        batch_size=args.bs,
-        shuffle=True,
-        drop_last=True,
+        cfg,
+        seed=args.seed,
+        train_shuffle=True,
+        val_shuffle=True,
+        train_drop_last=True,
+        val_drop_last=True,
     )
 
     def infinite_loader(loader):
@@ -399,8 +399,8 @@ def main():
 
     val_iter = infinite_loader(val_loader)
 
-    val_eval_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
-    test_eval_loader = DataLoader(test_dataset, batch_size=512, shuffle=False)
+    val_eval_loader = make_eval_loader(val_dataset, batch_size=512, num_workers=0, pin_memory=False)
+    test_eval_loader = make_eval_loader(test_dataset, batch_size=512, num_workers=0, pin_memory=False)
 
     # ---------------- models ----------------
     net = build_mlp(
@@ -451,8 +451,8 @@ def main():
         learner.train()
 
         for xb, yb in train_loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
+            xb = xb.to(device=device, dtype=torch.float32)
+            yb = yb.to(device=device, dtype=torch.long)
 
             # --- 1) Train batch: compute g_t ---
             logits_tr = net(xb)
@@ -478,8 +478,8 @@ def main():
 
             # --- 2) Val batch: compute val_loss and grad_val ---
             xv, yv = next(val_iter)
-            xv = xv.to(device)
-            yv = yv.to(device)
+            xv = xv.to(device=device, dtype=torch.float32)
+            yv = yv.to(device=device, dtype=torch.long)
 
             logits_val = net(xv)
             val_loss = ce(logits_val, yv)
@@ -578,8 +578,8 @@ def main():
             total = 0
             with torch.no_grad():
                 for xb_eval, yb_eval in data_loader:
-                    xb_eval = xb_eval.to(device)
-                    yb_eval = yb_eval.to(device)
+                    xb_eval = xb_eval.to(device=device, dtype=torch.float32)
+                    yb_eval = yb_eval.to(device=device, dtype=torch.long)
                     logits_eval = net(xb_eval)
                     loss_eval = ce(logits_eval, yb_eval)
                     losses.append(float(loss_eval.item()))
@@ -638,10 +638,10 @@ def main():
     # ---------------- final eval on full test set ----------------
     net.eval()
     with torch.no_grad():
-        logits_test = net(x_test_t.to(device))
-        final_test_loss = ce(logits_test, y_test_t.to(device)).item()
+        logits_test = net(x_test_t.to(device=device, dtype=torch.float32))
+        final_test_loss = ce(logits_test, y_test_t.to(device=device, dtype=torch.long)).item()
         preds_test = logits_test.argmax(dim=1)
-        final_test_acc = (preds_test == y_test_t.to(device)).float().mean().item()
+        final_test_acc = (preds_test == y_test_t.to(device=device, dtype=torch.long)).float().mean().item()
 
     print(
         f"[RESULT-MNIST1D-MLP-F1-PT] TestAcc={final_test_acc:.4f} "
