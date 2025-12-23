@@ -5,16 +5,16 @@
 MNIST-1D: Online learned optimizer baseline (coordinate-wise 2-layer LSTM),
 aligned with your F1 pipeline (single-task online meta-learning).
 
-Fixes vs your current version:
-  1) META OBJECTIVE SIGN FIX:
-       minimize dot = <grad_val(stop), Δw(phi)>
-     not -dot. Your previous sign maximized val loss, hence divergence.
-  2) Add gradient clipping for optimizer parameters (phi) for stability.
-  3) Keep LSTM preprocessing consistent with the paper Appendix A.
+Key fixes vs your current version:
+  A) Use THE SAME delta (including clipping) for meta-loss and for the actual apply.
+     -> avoids optimizing a different update than the one you apply.
+  B) Make clipping differentiable in meta-loss (no .item() / Python min in the coef path).
+  C) Add state reset (default: reset hidden/cell each epoch) for single-task stability.
+  D) Keep the correct meta-loss sign: minimize dot = <grad_val(stop), Δw>.
 
-Paper refs:
-  - Coordinatewise LSTM optimizer + update rule theta_{t+1} = theta_t + g_t(...)  :contentReference[oaicite:3]{index=3}
-  - Gradient preprocessing formula (Appendix A)                                :contentReference[oaicite:4]{index=4}
+Notes:
+  - This remains an online first-order meta objective: gradients through optimizee are stopped.
+  - Only LSTM learning rule differs; data split/norm, loaders, backbone remain aligned with F1.
 """
 
 import argparse
@@ -119,7 +119,8 @@ def to_NL(x: np.ndarray, length: int) -> np.ndarray:
 # --------------------------- MLP backbone ---------------------------
 
 def build_mlp(input_len: int = 40, num_layers: int = 5, width: int = 128, activation: str = "relu") -> nn.Module:
-    act_layer = nn.ReLU  # keep consistent with your baseline scripts
+    # keep consistent with your baseline scripts
+    act_layer = nn.ReLU
 
     class MLPBackbone(nn.Module):
         def __init__(self, length: int):
@@ -143,6 +144,13 @@ def build_mlp(input_len: int = 40, num_layers: int = 5, width: int = 128, activa
 # ---------------------- Learned Optimizer (coordinate-wise LSTM) ----------------------
 
 class LearnedOptimizer(nn.Module):
+    """
+    Coordinate-wise 2-layer LSTM optimizer.
+
+    Gradient preprocessing from paper Appendix A:
+      g -> (log(|g|)/p, sign(g)) if |g| >= exp(-p)
+           (-1, exp(p)*g)       otherwise
+    """
     def __init__(self, hidden_sz: int = 20, preproc: bool = True, preproc_factor: float = 10.0):
         super().__init__()
         self.hidden_sz = int(hidden_sz)
@@ -156,8 +164,7 @@ class LearnedOptimizer(nn.Module):
         self.out = nn.Linear(self.hidden_sz, 1)
 
     def _preprocess(self, g: torch.Tensor) -> torch.Tensor:
-        # g: [N,1]
-        gd = g.detach()
+        gd = g.detach()  # stop-grad through gradient input (first-order)
         out = torch.zeros(gd.size(0), 2, device=gd.device, dtype=gd.dtype)
         keep = (gd.abs() >= self.preproc_threshold).view(-1)
 
@@ -172,7 +179,7 @@ class LearnedOptimizer(nn.Module):
         if self.preproc:
             x = self._preprocess(grad_vec)  # [N,2]
         else:
-            x = grad_vec.detach()  # [N,1]
+            x = grad_vec.detach()           # [N,1]
         h0, c0 = self.lstm1(x, (hidden[0], cell[0]))
         h1, c1 = self.lstm2(h0, (hidden[1], cell[1]))
         update = self.out(h1)  # [N,1]
@@ -218,6 +225,22 @@ def eval_model(net: nn.Module, data_loader, device, ce):
     return (float(np.mean(losses)) if losses else float("nan"), correct / max(total, 1))
 
 
+def clip_delta_vec(delta_vec: torch.Tensor, clip_update: float | None, eps: float = 1e-12):
+    """
+    Differentiable global-norm clipping for meta-loss.
+    Returns:
+      delta_clipped, norm_before, coef
+    """
+    norm = torch.linalg.vector_norm(delta_vec.view(-1)).clamp_min(eps)
+    if clip_update is None or float(clip_update) <= 0.0:
+        coef = torch.ones((), device=delta_vec.device, dtype=delta_vec.dtype)
+        return delta_vec, norm, coef
+
+    clip_t = torch.tensor(float(clip_update), device=delta_vec.device, dtype=delta_vec.dtype)
+    coef = torch.clamp(clip_t / norm, max=1.0)
+    return delta_vec * coef, norm, coef
+
+
 # ------------------------------ Main ------------------------------
 
 def main():
@@ -235,13 +258,19 @@ def main():
 
     ap.add_argument("--opt_hidden_sz", type=int, default=20)
     ap.add_argument("--opt_lr", type=float, default=1e-3)
-    ap.add_argument("--out_mul", type=float, default=1e-3)  # safer default for online
+    ap.add_argument("--out_mul", type=float, default=1e-3)
     ap.add_argument("--no_preproc", action="store_true")
     ap.add_argument("--preproc_factor", type=float, default=10.0)
 
     ap.add_argument("--clip_update", type=float, default=0.1)     # Δw clip
     ap.add_argument("--reg_update", type=float, default=1e-6)     # update L2 reg
-    ap.add_argument("--clip_phi_grad", type=float, default=1.0)   # NEW: phi grad clip
+    ap.add_argument("--clip_phi_grad", type=float, default=1.0)   # phi grad clip
+
+    # state reset controls
+    ap.add_argument("--reset_state_each_epoch", action="store_true",
+                    help="reset LSTM hidden/cell to zeros at each epoch start (recommended for single-task)")
+    ap.add_argument("--state_reset_interval", type=int, default=0,
+                    help="if >0, reset hidden/cell every N train steps (in addition to epoch reset if enabled)")
 
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", type=str, default="l2o-mnist1d")
@@ -303,7 +332,7 @@ def main():
     x_test_t = torch.from_numpy(x_test)
     y_test_t = torch.from_numpy(y_test)
 
-    # Reproducible shuffling (closer to F1-style reproducibility)
+    # Reproducible shuffling
     gen = torch.Generator()
     gen.manual_seed(int(args.seed))
 
@@ -351,6 +380,7 @@ def main():
 
     params = list(net.parameters())
     n_params = int(sum(p.numel() for p in params))
+
     hidden = [torch.zeros(n_params, args.opt_hidden_sz, device=device) for _ in range(2)]
     cell = [torch.zeros(n_params, args.opt_hidden_sz, device=device) for _ in range(2)]
 
@@ -365,7 +395,7 @@ def main():
     result_path = run_dir / "result_l2l.json"
 
     with open(mech_path, "w") as f:
-        f.write("iter,epoch,train_loss,val_dot,meta_loss,update_norm,grad_norm\n")
+        f.write("iter,epoch,train_loss,val_dot,meta_loss,upd_norm,upd_norm_preclip,clip_coef,grad_norm\n")
     with open(train_log_path, "w") as f:
         f.write("epoch,elapsed_sec,train_loss,val_loss,test_loss,val_acc,test_acc\n")
 
@@ -380,10 +410,20 @@ def main():
         net.train()
         opt_net.train()
 
+        # recommended for single-task stability
+        if args.reset_state_each_epoch:
+            hidden = [torch.zeros_like(hidden[0]), torch.zeros_like(hidden[1])]
+            cell = [torch.zeros_like(cell[0]), torch.zeros_like(cell[1])]
+
         train_loss_sum = 0.0
         train_batches = 0
 
         for xb, yb in train_loader:
+            if args.state_reset_interval and args.state_reset_interval > 0:
+                if global_step % int(args.state_reset_interval) == 0 and global_step > 0:
+                    hidden = [torch.zeros_like(hidden[0]), torch.zeros_like(hidden[1])]
+                    cell = [torch.zeros_like(cell[0]), torch.zeros_like(cell[1])]
+
             xb = xb.to(device)
             yb = yb.to(device)
 
@@ -396,9 +436,13 @@ def main():
             grads = torch.autograd.grad(train_loss, params, create_graph=False, retain_graph=False, allow_unused=False)
             g_vec = flatten_like_params(grads, params)  # [N,1]
 
-            # ---- proposal Δw from current phi ----
-            update_vec_1, _, _ = opt_net(g_vec, hidden, cell)  # depends on phi
-            delta_list_1 = unflatten_to_params(update_vec_1 * args.out_mul, params)
+            # ---- ONE forward: Δw(phi) ----
+            update_vec, h_new, c_new = opt_net(g_vec, hidden, cell)  # depends on phi
+            delta_vec = update_vec * float(args.out_mul)
+
+            # clip (differentiable) BEFORE meta objective
+            delta_vec_clipped, upd_norm_pre, coef = clip_delta_vec(delta_vec, args.clip_update)
+            delta_list = unflatten_to_params(delta_vec_clipped, params)
 
             # ---- val grad (stop-grad) ----
             xv, yv = next(val_iter)
@@ -409,47 +453,32 @@ def main():
             grad_val = torch.autograd.grad(val_loss, params, create_graph=False, retain_graph=False, allow_unused=False)
 
             # dot = <grad_val(stop), Δw(phi)>
-            dot = torch.zeros([], device=device, dtype=update_vec_1.dtype)
-            for gv, dw in zip(grad_val, delta_list_1):
+            dot = torch.zeros([], device=device, dtype=delta_vec_clipped.dtype)
+            for gv, dw in zip(grad_val, delta_list):
                 dot = dot + (gv.detach() * dw).sum()
 
-            # ---------------- CRITICAL FIX ----------------
-            # Minimize dot to reduce val_loss after applying Δw:
-            #   L_val(w+Δw) ≈ L_val(w) + dot
+            # minimize dot to reduce val loss after applying Δw
             meta_loss = dot
             if args.reg_update is not None and float(args.reg_update) > 0.0:
-                meta_loss = meta_loss + float(args.reg_update) * torch.mean(update_vec_1.pow(2))
+                meta_loss = meta_loss + float(args.reg_update) * torch.mean(update_vec.pow(2))
 
             meta_opt.zero_grad(set_to_none=True)
             meta_loss.backward()
 
-            # NEW: clip optimizer-parameter grads
             if args.clip_phi_grad is not None and float(args.clip_phi_grad) > 0.0:
                 torch.nn.utils.clip_grad_norm_(opt_net.parameters(), max_norm=float(args.clip_phi_grad))
 
             meta_opt.step()
 
-            # ---- apply update using UPDATED phi (no grad) ----
+            # ---- apply THE SAME delta (exactly what meta optimized) ----
             with torch.no_grad():
-                update_vec_2, h_new_2, c_new_2 = opt_net(g_vec, hidden, cell)
-                delta_vec = update_vec_2 * args.out_mul  # [N,1]
-
-                # clip Δw global norm if requested
-                if args.clip_update is not None and float(args.clip_update) > 0.0:
-                    upd_norm = torch.linalg.vector_norm(delta_vec.view(-1)).clamp_min(1e-12)
-                    coef = min(1.0, float(args.clip_update) / float(upd_norm.item()))
-                    delta_vec.mul_(coef)
-                upd_norm = torch.linalg.vector_norm(delta_vec.view(-1)).clamp_min(1e-12)
-
-                # apply to params
-                delta_list = unflatten_to_params(delta_vec, params)
                 for p, dw in zip(params, delta_list):
                     p.add_(dw)
 
-                # carry state (detach each step, online / no BPTT)
-                hidden = [h.detach() for h in h_new_2]
-                cell = [c.detach() for c in c_new_2]
+                hidden = [h.detach() for h in h_new]
+                cell = [c.detach() for c in c_new]
 
+                upd_norm = torch.linalg.vector_norm(delta_vec_clipped.view(-1)).clamp_min(1e-12)
                 g_norm = torch.linalg.vector_norm(g_vec.view(-1)).clamp_min(1e-12)
 
                 with open(mech_path, "a") as f:
@@ -459,6 +488,8 @@ def main():
                         f"{float(dot.item()):.8f},"
                         f"{float(meta_loss.item()):.8f},"
                         f"{float(upd_norm.item()):.6g},"
+                        f"{float(upd_norm_pre.item()):.6g},"
+                        f"{float(coef.detach().item()):.6g},"
                         f"{float(g_norm.item()):.6g}\n"
                     )
 
