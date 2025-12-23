@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-MNIST-1D: Online learned optimizer baseline (coordinate-wise LSTM),
-aligned with your F1/F2/F3 pipeline (single-task online meta-learning).
+MNIST-1D: Online learned optimizer baseline (coordinate-wise 2-layer LSTM),
+aligned with your F1 pipeline (single-task online meta-learning).
 
-Key alignment:
-  - Same preprocess artifacts: split.json + norm.json under preprocess_dir/seed_{data_seed}
-  - Same Train/Val/Test split usage
-  - Same DataLoader pattern: each train batch pairs with one val batch
-  - Same backbone option as your MNIST1D MLP scripts (build_mlp)
+Fixes vs your current version:
+  1) META OBJECTIVE SIGN FIX:
+       minimize dot = <grad_val(stop), Δw(phi)>
+     not -dot. Your previous sign maximized val loss, hence divergence.
+  2) Add gradient clipping for optimizer parameters (phi) for stability.
+  3) Keep LSTM preprocessing consistent with the paper Appendix A.
 
-Method:
-  - Learned optimizer is a coordinate-wise 2-layer LSTM that outputs per-parameter update.
-  - Online meta-objective (first-order, no 2nd derivatives):
-        meta_loss = - <grad_val (stop-grad), Δw(phi)> + small regularizer
-  - Update optimizer params phi each train batch, then apply Δw with updated phi.
-  - Hidden states are carried across steps but DETACHED each step (online / no BPTT).
-
-Paper reference for coordinate-wise LSTM + gradient preprocessing:
-  "Learning to learn by gradient descent by gradient descent" (Appendix A).
+Paper refs:
+  - Coordinatewise LSTM optimizer + update rule theta_{t+1} = theta_t + g_t(...)  :contentReference[oaicite:3]{index=3}
+  - Gradient preprocessing formula (Appendix A)                                :contentReference[oaicite:4]{index=4}
 """
 
 import argparse
@@ -30,12 +26,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from data_mnist1d import load_mnist1d
 
-# Optional wandb
 try:
     import wandb  # type: ignore
 except ImportError:
@@ -45,8 +39,6 @@ except ImportError:
 # ------------------------------- Utilities -------------------------------
 
 class BatchLossLogger:
-    """Per-batch train loss logger (aligned style with your F-scripts)."""
-
     def __init__(self, run_dir: Path, meta: dict, filename: str, flush_every: int = 200):
         self.run_dir = Path(run_dir)
         self.meta = meta
@@ -96,25 +88,15 @@ def set_seed(s: int):
 
 
 def load_artifacts(preprocess_dir: Path, seed: int):
-    """
-    Load preprocessing artifacts:
-      - split.json: {train_idx, val_idx}
-      - norm.json:  {mean, std}
-    """
     pdir = Path(preprocess_dir) / f"seed_{seed}"
     split_path = pdir / "split.json"
     norm_path = pdir / "norm.json"
-
     if not split_path.exists() or not norm_path.exists():
-        raise FileNotFoundError(
-            f"Preprocess artifacts not found under: {pdir}. Run preprocess first."
-        )
-
+        raise FileNotFoundError(f"Preprocess artifacts not found under: {pdir}")
     with open(split_path, "r", encoding="utf-8") as f:
         split = json.load(f)
     with open(norm_path, "r", encoding="utf-8") as f:
         norm = json.load(f)
-
     return split, norm
 
 
@@ -136,13 +118,8 @@ def to_NL(x: np.ndarray, length: int) -> np.ndarray:
 
 # --------------------------- MLP backbone ---------------------------
 
-def build_mlp(
-    input_len: int = 40,
-    num_layers: int = 5,
-    width: int = 128,
-    activation: str = "relu",
-) -> nn.Module:
-    act_layer = nn.ReLU if activation.lower() == "relu" else nn.ReLU
+def build_mlp(input_len: int = 40, num_layers: int = 5, width: int = 128, activation: str = "relu") -> nn.Module:
+    act_layer = nn.ReLU  # keep consistent with your baseline scripts
 
     class MLPBackbone(nn.Module):
         def __init__(self, length: int):
@@ -166,21 +143,6 @@ def build_mlp(
 # ---------------------- Learned Optimizer (coordinate-wise LSTM) ----------------------
 
 class LearnedOptimizer(nn.Module):
-    """
-    Coordinate-wise 2-layer LSTM optimizer.
-
-    Gradient preprocessing from paper Appendix A:
-      g -> (log(|g|)/p, sign(g)) if |g| >= exp(-p)
-           (-1, exp(p)*g)       otherwise
-
-    Forward expects:
-      grad_vec: [N, 1]
-      hidden/cell: lists of length 2, each [N, hidden_sz]
-    Outputs:
-      update_vec: [N, 1]
-      new hidden/cell
-    """
-
     def __init__(self, hidden_sz: int = 20, preproc: bool = True, preproc_factor: float = 10.0):
         super().__init__()
         self.hidden_sz = int(hidden_sz)
@@ -195,19 +157,15 @@ class LearnedOptimizer(nn.Module):
 
     def _preprocess(self, g: torch.Tensor) -> torch.Tensor:
         # g: [N,1]
-        gd = g.detach()  # stop-grad through gradient input (first-order)
+        gd = g.detach()
         out = torch.zeros(gd.size(0), 2, device=gd.device, dtype=gd.dtype)
-
-        # keep: [N]
         keep = (gd.abs() >= self.preproc_threshold).view(-1)
 
-        # branch 1
         out[keep, 0] = (torch.log(gd[keep].abs() + 1e-8) / self.preproc_factor).view(-1)
         out[keep, 1] = torch.sign(gd[keep]).view(-1)
 
-        # branch 2
         out[~keep, 0] = -1.0
-        out[~keep, 1] = (np.exp(self.preproc_factor) * gd[~keep]).view(-1)
+        out[~keep, 1] = (float(np.exp(self.preproc_factor)) * gd[~keep]).view(-1)
         return out
 
     def forward(self, grad_vec: torch.Tensor, hidden, cell):
@@ -215,15 +173,13 @@ class LearnedOptimizer(nn.Module):
             x = self._preprocess(grad_vec)  # [N,2]
         else:
             x = grad_vec.detach()  # [N,1]
-
         h0, c0 = self.lstm1(x, (hidden[0], cell[0]))
         h1, c1 = self.lstm2(h0, (hidden[1], cell[1]))
-        update = self.out(h1)  # [N,1] (no tanh)
+        update = self.out(h1)  # [N,1]
         return update, (h0, h1), (c0, c1)
 
 
 def flatten_like_params(tensors, params):
-    """Concatenate list of tensors shaped like params into a single [N,1] vector."""
     vecs = []
     for t, p in zip(tensors, params):
         if t is None:
@@ -234,7 +190,6 @@ def flatten_like_params(tensors, params):
 
 
 def unflatten_to_params(vec: torch.Tensor, params):
-    """Split [N,1] vector into list of tensors shaped like params."""
     outs = []
     offset = 0
     v = vec.view(-1)
@@ -274,23 +229,20 @@ def main():
     ap.add_argument("--bs", type=int, default=128)
     ap.add_argument("--preprocess_dir", type=str, default="artifacts/preprocess")
 
-    # Backbone (align with your MLP F-scripts)
     ap.add_argument("--mlp_width", type=int, default=128)
     ap.add_argument("--mlp_layers", type=int, default=5)
     ap.add_argument("--activation", type=str, default="relu")
 
-    # Learned optimizer hyperparameters
     ap.add_argument("--opt_hidden_sz", type=int, default=20)
-    ap.add_argument("--opt_lr", type=float, default=1e-3, help="online meta LR for optimizer params")
-    ap.add_argument("--out_mul", type=float, default=0.1, help="scale applied to optimizer output update")
+    ap.add_argument("--opt_lr", type=float, default=1e-3)
+    ap.add_argument("--out_mul", type=float, default=1e-3)  # safer default for online
     ap.add_argument("--no_preproc", action="store_true")
     ap.add_argument("--preproc_factor", type=float, default=10.0)
 
-    # Clipping (align spirit with your F scripts)
-    ap.add_argument("--clip_update", type=float, default=1.0, help="global-norm clip on Δw (0 disables)")
-    ap.add_argument("--reg_update", type=float, default=1e-6, help="L2 reg on update_vec mean-square")
+    ap.add_argument("--clip_update", type=float, default=0.1)     # Δw clip
+    ap.add_argument("--reg_update", type=float, default=1e-6)     # update L2 reg
+    ap.add_argument("--clip_phi_grad", type=float, default=1.0)   # NEW: phi grad clip
 
-    # WandB
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", type=str, default="l2o-mnist1d")
     ap.add_argument("--wandb_group", type=str, default="mnist1d_mlp_l2l_online")
@@ -312,7 +264,6 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] run_dir = {run_dir}")
 
-    # ---------------- WandB init (optional) ----------------
     wandb_run = None
     if args.wandb:
         if wandb is None:
@@ -324,7 +275,7 @@ def main():
             config=vars(args),
         )
 
-    # ---------------- data (align with F scripts) ----------------
+    # ---------------- data ----------------
     (xtr, ytr), (xte, yte) = load_mnist1d(length=args.length, seed=args.data_seed)
 
     xtr = to_NL(xtr, length=args.length).astype(np.float32, copy=False)
@@ -352,8 +303,24 @@ def main():
     x_test_t = torch.from_numpy(x_test)
     y_test_t = torch.from_numpy(y_test)
 
-    train_loader = DataLoader(TensorDataset(x_train_t, y_train_t), batch_size=args.bs, shuffle=True, drop_last=True)
-    val_loader = DataLoader(TensorDataset(x_val_t, y_val_t), batch_size=args.bs, shuffle=True, drop_last=True)
+    # Reproducible shuffling (closer to F1-style reproducibility)
+    gen = torch.Generator()
+    gen.manual_seed(int(args.seed))
+
+    train_loader = DataLoader(
+        TensorDataset(x_train_t, y_train_t),
+        batch_size=args.bs,
+        shuffle=True,
+        drop_last=True,
+        generator=gen,
+    )
+    val_loader = DataLoader(
+        TensorDataset(x_val_t, y_val_t),
+        batch_size=args.bs,
+        shuffle=True,
+        drop_last=True,
+        generator=gen,
+    )
 
     def infinite_loader(loader):
         while True:
@@ -383,8 +350,6 @@ def main():
     ce = nn.CrossEntropyLoss()
 
     params = list(net.parameters())
-
-    # coordinate-wise hidden/cell: [N, hidden_sz]
     n_params = int(sum(p.numel() for p in params))
     hidden = [torch.zeros(n_params, args.opt_hidden_sz, device=device) for _ in range(2)]
     cell = [torch.zeros(n_params, args.opt_hidden_sz, device=device) for _ in range(2)]
@@ -400,7 +365,7 @@ def main():
     result_path = run_dir / "result_l2l.json"
 
     with open(mech_path, "w") as f:
-        f.write("iter,epoch,train_loss,val_dot,update_norm,grad_norm\n")
+        f.write("iter,epoch,train_loss,val_dot,meta_loss,update_norm,grad_norm\n")
     with open(train_log_path, "w") as f:
         f.write("epoch,elapsed_sec,train_loss,val_loss,test_loss,val_acc,test_acc\n")
 
@@ -422,7 +387,7 @@ def main():
             xb = xb.to(device)
             yb = yb.to(device)
 
-            # --- train loss + grad ---
+            # ---- train loss & grad (no 2nd derivatives) ----
             logits = net(xb)
             train_loss = ce(logits, yb)
             train_loss_sum += float(train_loss.item())
@@ -431,11 +396,11 @@ def main():
             grads = torch.autograd.grad(train_loss, params, create_graph=False, retain_graph=False, allow_unused=False)
             g_vec = flatten_like_params(grads, params)  # [N,1]
 
-            # --- proposal update from current optimizer ---
-            update_vec_1, h_new_1, c_new_1 = opt_net(g_vec, hidden, cell)  # update depends on opt_net params
+            # ---- proposal Δw from current phi ----
+            update_vec_1, _, _ = opt_net(g_vec, hidden, cell)  # depends on phi
             delta_list_1 = unflatten_to_params(update_vec_1 * args.out_mul, params)
 
-            # --- val grad ---
+            # ---- val grad (stop-grad) ----
             xv, yv = next(val_iter)
             xv = xv.to(device)
             yv = yv.to(device)
@@ -444,49 +409,55 @@ def main():
             grad_val = torch.autograd.grad(val_loss, params, create_graph=False, retain_graph=False, allow_unused=False)
 
             # dot = <grad_val(stop), Δw(phi)>
-            dot = torch.zeros([], device=device, dtype=torch.float32)
+            dot = torch.zeros([], device=device, dtype=update_vec_1.dtype)
             for gv, dw in zip(grad_val, delta_list_1):
-                dot = dot + (gv.detach().float() * dw.float()).sum()
+                dot = dot + (gv.detach() * dw).sum()
 
-            # meta objective: maximize dot => minimize -dot
-            meta_loss = -dot
+            # ---------------- CRITICAL FIX ----------------
+            # Minimize dot to reduce val_loss after applying Δw:
+            #   L_val(w+Δw) ≈ L_val(w) + dot
+            meta_loss = dot
             if args.reg_update is not None and float(args.reg_update) > 0.0:
                 meta_loss = meta_loss + float(args.reg_update) * torch.mean(update_vec_1.pow(2))
 
             meta_opt.zero_grad(set_to_none=True)
             meta_loss.backward()
+
+            # NEW: clip optimizer-parameter grads
+            if args.clip_phi_grad is not None and float(args.clip_phi_grad) > 0.0:
+                torch.nn.utils.clip_grad_norm_(opt_net.parameters(), max_norm=float(args.clip_phi_grad))
+
             meta_opt.step()
 
-            # --- apply update using UPDATED optimizer params ---
+            # ---- apply update using UPDATED phi (no grad) ----
             with torch.no_grad():
                 update_vec_2, h_new_2, c_new_2 = opt_net(g_vec, hidden, cell)
                 delta_vec = update_vec_2 * args.out_mul  # [N,1]
 
                 # clip Δw global norm if requested
                 if args.clip_update is not None and float(args.clip_update) > 0.0:
-                    upd_norm = torch.sqrt(torch.sum(delta_vec.view(-1) ** 2) + 1e-12)
+                    upd_norm = torch.linalg.vector_norm(delta_vec.view(-1)).clamp_min(1e-12)
                     coef = min(1.0, float(args.clip_update) / float(upd_norm.item()))
                     delta_vec.mul_(coef)
-                else:
-                    upd_norm = torch.sqrt(torch.sum(delta_vec.view(-1) ** 2) + 1e-12)
+                upd_norm = torch.linalg.vector_norm(delta_vec.view(-1)).clamp_min(1e-12)
 
                 # apply to params
                 delta_list = unflatten_to_params(delta_vec, params)
                 for p, dw in zip(params, delta_list):
-                    p.add_(dw.to(p.dtype))
+                    p.add_(dw)
 
-                # update optimizer state (carry across steps, but detach)
+                # carry state (detach each step, online / no BPTT)
                 hidden = [h.detach() for h in h_new_2]
                 cell = [c.detach() for c in c_new_2]
 
-                # log mechanism
-                g_norm = torch.sqrt(torch.sum(g_vec.view(-1) ** 2) + 1e-12)
+                g_norm = torch.linalg.vector_norm(g_vec.view(-1)).clamp_min(1e-12)
 
                 with open(mech_path, "a") as f:
                     f.write(
                         f"{global_step},{epoch},"
                         f"{float(train_loss.item()):.8f},"
                         f"{float(dot.item()):.8f},"
+                        f"{float(meta_loss.item()):.8f},"
                         f"{float(upd_norm.item()):.6g},"
                         f"{float(g_norm.item()):.6g}\n"
                     )
@@ -494,7 +465,7 @@ def main():
             curve_logger.on_train_batch_end(float(train_loss.item()))
             global_step += 1
 
-        # --- epoch eval ---
+        # ---- epoch eval ----
         train_loss_epoch = train_loss_sum / max(train_batches, 1)
         val_loss_epoch, val_acc = eval_model(net, val_eval_loader, device, ce)
         test_loss_epoch, test_acc = eval_model(net, test_eval_loader, device, ce)
@@ -515,8 +486,7 @@ def main():
         print(
             f"[MNIST1D-MLP-L2L-ONLINE EPOCH {epoch}] "
             f"time={epoch_elapsed:.2f}s total={total_elapsed/60:.2f}min "
-            f"train={train_loss_epoch:.4f} "
-            f"val={val_loss_epoch:.4f} test={test_loss_epoch:.4f} "
+            f"train={train_loss_epoch:.4f} val={val_loss_epoch:.4f} test={test_loss_epoch:.4f} "
             f"val_acc={val_acc:.4f} test_acc={test_acc:.4f}"
         )
 
@@ -561,24 +531,6 @@ def main():
         "test_loss": float(final_test_loss),
         "elapsed_sec": float(total_time),
         "run_dir": str(run_dir),
-        "preprocess": str(Path(args.preprocess_dir) / f"seed_{args.data_seed}"),
-        "hparams": {
-            "mlp_width": args.mlp_width,
-            "mlp_layers": args.mlp_layers,
-            "activation": args.activation,
-            "opt_hidden_sz": args.opt_hidden_sz,
-            "opt_lr": args.opt_lr,
-            "out_mul": args.out_mul,
-            "preproc": bool(not args.no_preproc),
-            "preproc_factor": args.preproc_factor,
-            "clip_update": args.clip_update,
-            "reg_update": args.reg_update,
-        },
-        "logs": {
-            "curve": str(curve_logger.curve_path),
-            "mechanism": str(mech_path),
-            "train_log": str(train_log_path),
-        },
     }
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
