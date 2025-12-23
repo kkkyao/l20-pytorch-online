@@ -5,16 +5,16 @@
 MNIST-1D: Online learned optimizer baseline (coordinate-wise 2-layer LSTM),
 aligned with your F1 pipeline (single-task online meta-learning).
 
-Key fixes vs your current version:
+Key fixes vs your previous version:
   A) Use THE SAME delta (including clipping) for meta-loss and for the actual apply.
      -> avoids optimizing a different update than the one you apply.
-  B) Make clipping differentiable in meta-loss (no .item() / Python min in the coef path).
-  C) Add state reset (default: reset hidden/cell each epoch) for single-task stability.
+  B) Make clipping differentiable in meta-loss (no .item() / Python min in coef path).
+  C) Add state reset controls (epoch reset default OFF; you enable via flag).
   D) Keep the correct meta-loss sign: minimize dot = <grad_val(stop), Δw>.
 
 Notes:
-  - This remains an online first-order meta objective: gradients through optimizee are stopped.
-  - Only LSTM learning rule differs; data split/norm, loaders, backbone remain aligned with F1.
+  - Online first-order meta objective: gradients through optimizee are stopped.
+  - Only learning rule differs; data split/norm, loaders, backbone remain aligned with your F1 setup.
 """
 
 import argparse
@@ -22,6 +22,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -48,7 +49,7 @@ class BatchLossLogger:
         self.rows = []
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.curve_path = self.run_dir / filename
-        with open(self.curve_path, "w") as f:
+        with open(self.curve_path, "w", encoding="utf-8") as f:
             f.write("iter,epoch,loss,method,seed,opt,lr\n")
 
     def on_epoch_begin(self, epoch: int):
@@ -74,7 +75,7 @@ class BatchLossLogger:
             self._flush()
 
     def _flush(self):
-        with open(self.curve_path, "a") as f:
+        with open(self.curve_path, "a", encoding="utf-8") as f:
             for r in self.rows:
                 f.write(",".join(map(str, r)) + "\n")
         self.rows.clear()
@@ -120,6 +121,7 @@ def to_NL(x: np.ndarray, length: int) -> np.ndarray:
 
 def build_mlp(input_len: int = 40, num_layers: int = 5, width: int = 128, activation: str = "relu") -> nn.Module:
     # keep consistent with your baseline scripts
+    _ = activation  # reserved for future; keep signature aligned
     act_layer = nn.ReLU
 
     class MLPBackbone(nn.Module):
@@ -225,11 +227,14 @@ def eval_model(net: nn.Module, data_loader, device, ce):
     return (float(np.mean(losses)) if losses else float("nan"), correct / max(total, 1))
 
 
-def clip_delta_vec(delta_vec: torch.Tensor, clip_update: float | None, eps: float = 1e-12):
+def clip_delta_vec(delta_vec: torch.Tensor, clip_update: Optional[float], eps: float = 1e-12):
     """
     Differentiable global-norm clipping for meta-loss.
+
     Returns:
-      delta_clipped, norm_before, coef
+      delta_clipped: clipped delta vector
+      norm_before:  norm(delta) before clipping
+      coef:         scaling coef in [0,1]
     """
     norm = torch.linalg.vector_norm(delta_vec.view(-1)).clamp_min(eps)
     if clip_update is None or float(clip_update) <= 0.0:
@@ -263,7 +268,7 @@ def main():
     ap.add_argument("--preproc_factor", type=float, default=10.0)
 
     ap.add_argument("--clip_update", type=float, default=0.1)     # Δw clip
-    ap.add_argument("--reg_update", type=float, default=1e-6)     # update L2 reg
+    ap.add_argument("--reg_update", type=float, default=1e-6)     # update L2 reg on raw update_vec
     ap.add_argument("--clip_phi_grad", type=float, default=1.0)   # phi grad clip
 
     # state reset controls
@@ -394,9 +399,9 @@ def main():
     train_log_path = run_dir / "train_log_l2l.csv"
     result_path = run_dir / "result_l2l.json"
 
-    with open(mech_path, "w") as f:
+    with open(mech_path, "w", encoding="utf-8") as f:
         f.write("iter,epoch,train_loss,val_dot,meta_loss,upd_norm,upd_norm_preclip,clip_coef,grad_norm\n")
-    with open(train_log_path, "w") as f:
+    with open(train_log_path, "w", encoding="utf-8") as f:
         f.write("epoch,elapsed_sec,train_loss,val_loss,test_loss,val_acc,test_acc\n")
 
     global_step = 0
@@ -410,7 +415,7 @@ def main():
         net.train()
         opt_net.train()
 
-        # recommended for single-task stability
+        # optional: recommended for single-task stability
         if args.reset_state_each_epoch:
             hidden = [torch.zeros_like(hidden[0]), torch.zeros_like(hidden[1])]
             cell = [torch.zeros_like(cell[0]), torch.zeros_like(cell[1])]
@@ -436,12 +441,12 @@ def main():
             grads = torch.autograd.grad(train_loss, params, create_graph=False, retain_graph=False, allow_unused=False)
             g_vec = flatten_like_params(grads, params)  # [N,1]
 
-            # ---- ONE forward: Δw(phi) ----
+            # ---- ONE forward: Δw(phi, state) ----
             update_vec, h_new, c_new = opt_net(g_vec, hidden, cell)  # depends on phi
             delta_vec = update_vec * float(args.out_mul)
 
             # clip (differentiable) BEFORE meta objective
-            delta_vec_clipped, upd_norm_pre, coef = clip_delta_vec(delta_vec, args.clip_update)
+            delta_vec_clipped, upd_norm_pre, coef = clip_delta_vec(delta_vec, float(args.clip_update))
             delta_list = unflatten_to_params(delta_vec_clipped, params)
 
             # ---- val grad (stop-grad) ----
@@ -481,7 +486,7 @@ def main():
                 upd_norm = torch.linalg.vector_norm(delta_vec_clipped.view(-1)).clamp_min(1e-12)
                 g_norm = torch.linalg.vector_norm(g_vec.view(-1)).clamp_min(1e-12)
 
-                with open(mech_path, "a") as f:
+                with open(mech_path, "a", encoding="utf-8") as f:
                     f.write(
                         f"{global_step},{epoch},"
                         f"{float(train_loss.item()):.8f},"
@@ -504,7 +509,7 @@ def main():
         total_elapsed = time.time() - start_time
         epoch_elapsed = time.time() - epoch_start
 
-        with open(train_log_path, "a") as f:
+        with open(train_log_path, "a", encoding="utf-8") as f:
             f.write(
                 f"{epoch},{total_elapsed:.3f},"
                 f"{train_loss_epoch:.8f},"
