@@ -5,21 +5,24 @@
 MNIST-1D: Learned optimizer (coordinate-wise 2-layer LSTM) trained with truncated BPTT
 through the optimizee trajectory (Route B, aligned to Andrychowicz et al. 2016 Eq.(3)).
 
-Key points (paper alignment):
-  - Meta objective is trajectory loss: sum_{t=1..T} w_t f(theta_t), Eq.(3). We use w_t=1 by default.
-  - Optimizer is coordinate-wise 2-layer LSTM with shared weights across coordinates (Fig.3).
-  - Truncated BPTT: unroll K steps, backprop meta-loss through the unrolled graph, then detach
-    optimizee parameters and optimizer hidden states before next segment.
-  - (Optional, default OFF) We drop gradients along dashed edges (first-order approximation):
-      assume ∂(∇_t)/∂phi = 0 by detaching gradient input to the optimizer.
-    This matches the paper's description of dropping dashed edges to avoid second derivatives.
+Paper alignment (what this script implements):
+  1) Meta-objective = trajectory loss  Σ_{t=1..K} w_t f(θ_t)  (Eq.(3)), default w_t=1.
+  2) Optimizer = coordinate-wise 2-layer LSTM with shared weights across coordinates (Fig.3).
+  3) Truncated BPTT = unroll K inner steps, backprop through the unrolled computation graph,
+     then DETACH optimizee parameters and optimizer hidden states (truncate) before next segment.
+  4) Optional “drop dashed edges” (first-order approximation) by detaching the gradient input
+     to the optimizer (matches paper’s dashed-edge dropping to avoid second derivatives).
 
-Extra (engineering knobs):
-  - Optional global-norm clipping of update Δθ (not required by the paper; default disabled).
-  - Optional meta objective augmentation with val loss at the end of unroll (B2-style), default 0.
-  - Optional reset of optimizer state each epoch / interval.
+Engineering improvements vs your current script:
+  - Fixes the crash: autograd.grad inside unroll now uses retain_graph=True so meta_loss.backward()
+    can backprop through the same unrolled graph (no “backward through graph a second time” error).
+  - Correctly handles full vs first-order: create_graph is enabled only when you do NOT drop dashed edges.
+  - Uses weighted loss averaging by batch size for train_loss metrics (more comparable across settings).
+  - Logs per-inner-step loss/acc (curve) and per-segment diagnostics (mechanism file).
+  - Uses torch.func.functional_call when available; falls back for older torch.
 
-Reference: "Learning to learn by gradient descent by gradient descent", Andrychowicz et al., NIPS 2016.
+Reference:
+  "Learning to learn by gradient descent by gradient descent", Andrychowicz et al., NeurIPS 2016.
 """
 
 import argparse
@@ -41,32 +44,43 @@ try:
 except ImportError:
     wandb = None
 
-# -------- functional_call compatibility (torch 2.x) --------
-try:
-    # torch<=2.0 / 2.1 often has this
-    from torch.nn.utils.stateless import functional_call as _functional_call  # type: ignore
-    def functional_call(module: nn.Module, params: Dict[str, torch.Tensor], args: Tuple[torch.Tensor, ...]):
-        return _functional_call(module, params, args)
-except Exception:
-    # torch.func.functional_call (torch>=2.0)
+
+# -------- functional_call compatibility (prefer torch.func in torch>=2.0) --------
+def _get_functional_call():
     try:
-        from torch.func import functional_call as _functional_call  # type: ignore
-        def functional_call(module: nn.Module, params: Dict[str, torch.Tensor], args: Tuple[torch.Tensor, ...]):
-            return _functional_call(module, params, args)
-    except Exception as e:
-        raise ImportError("Could not import functional_call from torch. Please use torch>=2.0.") from e
+        from torch.func import functional_call as fcall  # type: ignore
+        return fcall
+    except Exception:
+        try:
+            from torch.nn.utils.stateless import functional_call as fcall  # type: ignore
+            return fcall
+        except Exception as e:
+            raise ImportError(
+                "Could not import functional_call. Please use PyTorch >= 2.0 (torch.func) "
+                "or a version that still provides torch.nn.utils.stateless.functional_call."
+            ) from e
+
+
+_functional_call = _get_functional_call()
+
+
+def functional_call(module: nn.Module, params: Dict[str, torch.Tensor], args: Tuple[torch.Tensor, ...]):
+    return _functional_call(module, params, args)
 
 
 # ------------------------------- Utilities -------------------------------
 
 class BatchLossLogger:
+    """
+    Logs per-inner-step train loss/acc (not per-epoch).
+    """
     def __init__(self, run_dir: Path, meta: dict, filename: str, flush_every: int = 200):
         self.run_dir = Path(run_dir)
         self.meta = meta
         self.flush_every = flush_every
         self.global_iter = 0
         self.curr_epoch = 0
-        self.rows = []
+        self.rows: List[List[object]] = []
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.curve_path = self.run_dir / filename
         with open(self.curve_path, "w", encoding="utf-8") as f:
@@ -138,6 +152,12 @@ def to_NL(x: np.ndarray, length: int) -> np.ndarray:
     raise AssertionError(f"Unexpected x shape: {x.shape}")
 
 
+def infinite_loader(loader: DataLoader) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+    while True:
+        for b in loader:
+            yield b
+
+
 # --------------------------- MLP backbone ---------------------------
 
 def build_mlp(input_len: int = 40, num_layers: int = 5, width: int = 128, activation: str = "relu") -> nn.Module:
@@ -146,7 +166,7 @@ def build_mlp(input_len: int = 40, num_layers: int = 5, width: int = 128, activa
     class MLPBackbone(nn.Module):
         def __init__(self, length: int):
             super().__init__()
-            layers = []
+            layers: List[nn.Module] = []
             in_dim = length
             for _ in range(max(0, num_layers)):
                 layers.append(nn.Linear(in_dim, width))
@@ -166,15 +186,15 @@ def build_mlp(input_len: int = 40, num_layers: int = 5, width: int = 128, activa
 
 class LearnedOptimizer(nn.Module):
     """
-    Coordinate-wise 2-layer LSTM optimizer (Fig.3 in the paper).
+    Coordinate-wise 2-layer LSTM optimizer (Fig.3).
 
     Gradient preprocessing (Appendix A):
       g -> (log(|g|)/p, sign(g)) if |g| >= exp(-p)
            (-1, exp(p)*g)       otherwise
 
-    NOTE on "drop dashed edges" (paper):
-      You can detach the gradient input so that ∂(∇_t)/∂phi = 0 (no second derivatives).
-      This is controlled by `detach_grad_input`.
+    Detach policy:
+      detach_grad_input=True  => "drop dashed edges" (first-order) as described in the paper.
+      detach_grad_input=False => keep full gradient flow (includes second derivatives).
     """
     def __init__(
         self,
@@ -212,21 +232,19 @@ class LearnedOptimizer(nn.Module):
 
     def forward(self, grad_vec: torch.Tensor, hidden, cell):
         if self.preproc:
-            x = self._preprocess(grad_vec)  # [N,2]
+            x = self._preprocess(grad_vec)      # [N,2]
         else:
-            x = self._maybe_detach(grad_vec)  # [N,1]
+            x = self._maybe_detach(grad_vec)     # [N,1]
         h0, c0 = self.lstm1(x, (hidden[0], cell[0]))
         h1, c1 = self.lstm2(h0, (hidden[1], cell[1]))
-        update = self.out(h1)  # [N,1]
+        update = self.out(h1)                    # [N,1]
         return update, (h0, h1), (c0, c1)
 
 
+# ---------------------- Vectorization helpers ----------------------
+
 def named_params_dict(module: nn.Module) -> Dict[str, torch.Tensor]:
     return {k: v for k, v in module.named_parameters()}
-
-
-def params_to_vector(params: List[torch.Tensor]) -> torch.Tensor:
-    return torch.cat([p.reshape(-1) for p in params], dim=0).view(-1, 1)  # [N,1]
 
 
 def grads_to_vector(grads: List[torch.Tensor], params: List[torch.Tensor]) -> torch.Tensor:
@@ -253,8 +271,7 @@ def vector_to_params(vec: torch.Tensor, params_template: List[torch.Tensor]) -> 
 def clip_delta_vec(delta_vec: torch.Tensor, clip_update: Optional[float], eps: float = 1e-12):
     """
     Differentiable global-norm clipping for delta (Δθ).
-    Returns:
-      delta_clipped, norm_before, coef
+    Returns: (delta_clipped, norm_before, coef)
     """
     norm = torch.linalg.vector_norm(delta_vec.view(-1)).clamp_min(eps)
     if clip_update is None or float(clip_update) <= 0.0:
@@ -275,25 +292,22 @@ def eval_with_params(
     ce: nn.Module,
 ):
     net.eval()
-    losses = []
-    correct = 0
+    losses_sum = 0.0
     total = 0
+    correct = 0
     for xb, yb in data_loader:
         xb = xb.to(device)
         yb = yb.to(device)
         logits = functional_call(net, params, (xb,))
         loss = ce(logits, yb)
-        losses.append(float(loss.item()))
+        bs = int(yb.size(0))
+        losses_sum += float(loss.item()) * bs
+        total += bs
         pred = logits.argmax(dim=1)
         correct += int((pred == yb).sum().item())
-        total += int(yb.size(0))
-    return (float(np.mean(losses)) if losses else float("nan"), correct / max(total, 1))
-
-
-def infinite_loader(loader: DataLoader) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-    while True:
-        for b in loader:
-            yield b
+    avg_loss = losses_sum / max(total, 1)
+    acc = correct / max(total, 1)
+    return float(avg_loss), float(acc)
 
 
 # ------------------------------ Main ------------------------------
@@ -319,32 +333,36 @@ def main():
     ap.add_argument("--out_mul", type=float, default=1e-3)
     ap.add_argument("--no_preproc", action="store_true")
     ap.add_argument("--preproc_factor", type=float, default=10.0)
-    ap.add_argument("--detach_grad_input", action="store_true",
-                    help="Drop dashed edges (first-order): detach gradient input to optimizer (recommended to match paper).")
+    ap.add_argument(
+        "--detach_grad_input",
+        action="store_true",
+        help="Drop dashed edges (first-order): detach gradient input to optimizer (paper-style).",
+    )
 
     # route B: truncated BPTT
-    ap.add_argument("--unroll_steps", type=int, default=20,
-                    help="K: truncated BPTT unroll length (paper uses truncated BPTT; e.g., 20).")
-    ap.add_argument("--wt", type=float, default=1.0,
-                    help="Trajectory weight w_t (default 1.0, matches paper's experiments).")
-    ap.add_argument("--meta_val_coef", type=float, default=0.0,
-                    help="Optional B2-style: meta_loss += meta_val_coef * val_loss(theta_K). Default 0 (paper-like).")
+    ap.add_argument("--unroll_steps", type=int, default=20, help="K: truncated BPTT unroll length.")
+    ap.add_argument("--wt", type=float, default=1.0, help="Trajectory weight w_t (default 1.0).")
+    ap.add_argument(
+        "--meta_val_coef",
+        type=float,
+        default=0.0,
+        help="Optional B2-style: meta_loss += meta_val_coef * val_loss(theta_K). Default 0 (paper-like).",
+    )
 
     # stability knobs
-    ap.add_argument("--clip_update", type=float, default=0.0,
-                    help="Global-norm clip for Δθ. Default 0 (disabled; not required by paper).")
-    ap.add_argument("--reg_update", type=float, default=0.0,
-                    help="L2 regularization on raw update output (engineering; default 0).")
-    ap.add_argument("--clip_phi_grad", type=float, default=1.0,
-                    help="Gradient clipping for optimizer parameters (outer loop).")
-    ap.add_argument("--reset_state_each_epoch", action="store_true",
-                    help="Reset LSTM hidden/cell to zeros at each epoch start (often helps single-task stability).")
-    ap.add_argument("--state_reset_interval", type=int, default=0,
-                    help="If >0, reset hidden/cell every N inner steps.")
+    ap.add_argument("--clip_update", type=float, default=0.0, help="Global-norm clip for Δθ (0 disables).")
+    ap.add_argument("--reg_update", type=float, default=0.0, help="L2 reg on update outputs (0 disables).")
+    ap.add_argument("--clip_phi_grad", type=float, default=1.0, help="Outer grad clip for optimizer params.")
+    ap.add_argument("--reset_state_each_epoch", action="store_true", help="Reset optimizer state each epoch.")
+    ap.add_argument("--state_reset_interval", type=int, default=0, help="Reset optimizer state every N inner steps.")
 
     # init options (paper mentions IID Gaussian init for optimizee)
-    ap.add_argument("--init_normal_std", type=float, default=0.0,
-                    help="If >0, re-init optimizee parameters ~ N(0, std). Default 0 keeps module default init.")
+    ap.add_argument(
+        "--init_normal_std",
+        type=float,
+        default=0.0,
+        help="If >0, re-init optimizee parameters ~ N(0, std). Default 0 keeps module init.",
+    )
 
     # wandb
     ap.add_argument("--wandb", action="store_true")
@@ -414,7 +432,7 @@ def main():
         TensorDataset(x_train_t, y_train_t),
         batch_size=args.bs,
         shuffle=True,
-        drop_last=True,
+        drop_last=False,   # keep all data; segments can be shorter than K at epoch end
         generator=gen,
     )
     val_loader = DataLoader(
@@ -452,13 +470,13 @@ def main():
     meta_opt = torch.optim.Adam(opt_net.parameters(), lr=args.opt_lr)
     ce = nn.CrossEntropyLoss()
 
-    # optimizee params (functional) and optimizer state
+    # optimizee params as a functional dict (these are the "θ" in the paper)
     params_dict = named_params_dict(net)
-    # Ensure params are on device and require grad (functional_call needs tensors with grad)
     params_dict = {k: v.detach().to(device).requires_grad_(True) for k, v in params_dict.items()}
-    params_list_template = [params_dict[k] for k in params_dict.keys()]
-    n_params = int(sum(p.numel() for p in params_list_template))
+    params_template_list = list(params_dict.values())
+    n_params = int(sum(p.numel() for p in params_template_list))
 
+    # optimizer hidden state per coordinate
     hidden = [torch.zeros(n_params, args.opt_hidden_sz, device=device) for _ in range(2)]
     cell = [torch.zeros(n_params, args.opt_hidden_sz, device=device) for _ in range(2)]
 
@@ -473,7 +491,7 @@ def main():
     result_path = run_dir / "result_l2o_truncbptt.json"
 
     with open(mech_path, "w", encoding="utf-8") as f:
-        f.write("global_step,epoch,seg_id,inner_steps,meta_loss,train_loss_avg,train_acc_avg,upd_norm,clip_coef\n")
+        f.write("global_step,epoch,seg_id,inner_steps,meta_loss,train_loss_avg,train_acc,upd_norm,clip_coef\n")
     with open(train_log_path, "w", encoding="utf-8") as f:
         f.write("epoch,elapsed_sec,train_loss,train_acc,val_loss,test_loss,val_acc,test_acc\n")
 
@@ -492,79 +510,115 @@ def main():
             hidden = [torch.zeros_like(hidden[0]), torch.zeros_like(hidden[1])]
             cell = [torch.zeros_like(cell[0]), torch.zeros_like(cell[1])]
 
-        # For epoch metrics, we track actual losses/acc over seen batches (detached)
-        epoch_train_loss_sum = 0.0
-        epoch_train_correct = 0
-        epoch_train_total = 0
-        epoch_batches = 0
+        # epoch metrics (weighted by batch size)
+        epoch_loss_sum = 0.0
+        epoch_total = 0
+        epoch_correct = 0
 
         seg_id = 0
         train_iter = iter(train_loader)
 
         while True:
-            # Collect K batches for this unroll; if not enough batches left, end epoch.
+            # Collect up to K batches for this unroll; allow shorter final segment.
             batches: List[Tuple[torch.Tensor, torch.Tensor]] = []
-            try:
-                for _ in range(int(args.unroll_steps)):
+            for _ in range(int(args.unroll_steps)):
+                try:
                     xb, yb = next(train_iter)
                     batches.append((xb, yb))
-            except StopIteration:
+                except StopIteration:
+                    break
+            if len(batches) == 0:
                 break
 
+            # Optional periodic reset of optimizer state
             if args.state_reset_interval and args.state_reset_interval > 0:
-                if global_step % int(args.state_reset_interval) == 0 and global_step > 0:
+                if global_step > 0 and (global_step % int(args.state_reset_interval) == 0):
                     hidden = [torch.zeros_like(hidden[0]), torch.zeros_like(hidden[1])]
                     cell = [torch.zeros_like(cell[0]), torch.zeros_like(cell[1])]
 
-            # Build unrolled graph
+            # Truncated BPTT segment graph build
             meta_loss = torch.zeros((), device=device)
-            seg_loss_sum_det = 0.0
-            seg_correct = 0
+            seg_loss_sum = 0.0
             seg_total = 0
+            seg_correct = 0
 
-            # We'll update params_dict functionally each inner step
-            for inner_t, (xb, yb) in enumerate(batches, start=1):
+            # For reg_update (engineering), accumulate per-step update magnitude
+            upd_reg_accum = torch.zeros((), device=device)
+
+            # In full (non-first-order) mode, we need grads that keep graph for higher-order derivatives.
+            need_2nd = (not bool(args.detach_grad_input))
+
+            last_delta_vec_clipped = None
+            last_clip_coef = None
+
+            for xb, yb in batches:
                 xb = xb.to(device)
                 yb = yb.to(device)
+                bs = int(yb.size(0))
 
                 logits = functional_call(net, params_dict, (xb,))
                 loss = ce(logits, yb)
 
-                # Eq.(3): add w_t * f(theta_t); default w_t=1
+                # Eq.(3): trajectory objective Σ w_t f(θ_t)
                 meta_loss = meta_loss + float(args.wt) * loss
 
-                # detached metrics
+                # Metrics (detached)
                 with torch.no_grad():
-                    seg_loss_sum_det += float(loss.item())
                     pred = logits.argmax(dim=1)
-                    seg_correct += int((pred == yb).sum().item())
-                    seg_total += int(yb.size(0))
+                    correct = int((pred == yb).sum().item())
+                    seg_correct += correct
+                    seg_total += bs
+                    seg_loss_sum += float(loss.item()) * bs
 
-                # Compute optimizee gradient wrt current theta_t
-                # (If detach_grad_input=True, optimizer input won't backprop into this grad -> no 2nd derivatives)
-                params_list = [params_dict[k] for k in params_dict.keys()]
-                grads = torch.autograd.grad(loss, params_list, create_graph=False, retain_graph=False, allow_unused=False)
+                    epoch_correct += correct
+                    epoch_total += bs
+                    epoch_loss_sum += float(loss.item()) * bs
+
+                    step_acc = correct / max(bs, 1)
+                    curve_logger.on_train_step_end(float(loss.item()), float(step_acc))
+
+                # Gradient wrt current optimizee params (θ_t)
+                params_list = list(params_dict.values())
+
+                # CRITICAL FIX:
+                #  - retain_graph=True so that meta_loss.backward() can still backprop through the same segment graph.
+                #  - create_graph=True only if you are NOT dropping dashed edges (need higher-order terms).
+                grads = torch.autograd.grad(
+                    loss,
+                    params_list,
+                    create_graph=need_2nd,
+                    retain_graph=True,
+                    allow_unused=False,
+                )
                 g_vec = grads_to_vector(list(grads), params_list)  # [N,1]
 
-                # Learned optimizer proposes update
+                # Learned optimizer produces an update proposal
                 upd_vec, h_new, c_new = opt_net(g_vec, hidden, cell)
-                delta_vec = upd_vec * float(args.out_mul)  # Δθ proposal (paper: θ_{t+1} = θ_t + g_t)
+                delta_vec = upd_vec * float(args.out_mul)
 
-                # Optional global-norm clip for stability (not required by paper)
-                delta_vec_clipped, _, coef = clip_delta_vec(delta_vec, float(args.clip_update) if args.clip_update else 0.0)
+                # Optional Δθ clipping (engineering; off by default)
+                delta_vec_clipped, _, coef = clip_delta_vec(delta_vec, float(args.clip_update))
                 delta_list = vector_to_params(delta_vec_clipped, params_list)
 
-                # Functional parameter update: theta_{t+1} = theta_t + delta
-                new_params_dict: Dict[str, torch.Tensor] = {}
+                # Functional update: θ_{t+1} = θ_t + Δθ_t
+                new_params: Dict[str, torch.Tensor] = {}
                 for (name, p), dp in zip(params_dict.items(), delta_list):
-                    new_params_dict[name] = p + dp
-                params_dict = new_params_dict
+                    new_params[name] = p + dp
+                params_dict = new_params
 
                 hidden = list(h_new)
                 cell = list(c_new)
+
+                # Engineering reg (accumulate magnitude)
+                if args.reg_update and float(args.reg_update) > 0.0:
+                    upd_reg_accum = upd_reg_accum + torch.mean(upd_vec.pow(2))
+
+                last_delta_vec_clipped = delta_vec_clipped
+                last_clip_coef = coef
+
                 global_step += 1
 
-            # Optional B2-style val loss at theta_K (default OFF)
+            # Optional B2-style term at θ_K (default 0 to stay paper-like)
             if args.meta_val_coef and float(args.meta_val_coef) > 0.0:
                 xv, yv = next(val_iter)
                 xv = xv.to(device)
@@ -573,50 +627,45 @@ def main():
                 val_loss_last = ce(val_logits, yv)
                 meta_loss = meta_loss + float(args.meta_val_coef) * val_loss_last
 
-            # Optional regularization on raw update output magnitude (engineering)
+            # Optional update magnitude regularization (engineering)
             if args.reg_update and float(args.reg_update) > 0.0:
-                meta_loss = meta_loss + float(args.reg_update) * torch.mean(upd_vec.pow(2))
+                meta_loss = meta_loss + float(args.reg_update) * (upd_reg_accum / max(len(batches), 1))
 
-            # Outer update (optimize phi)
+            # Outer update: optimize φ via backprop through the unrolled segment
             meta_opt.zero_grad(set_to_none=True)
             meta_loss.backward()
-
             if args.clip_phi_grad and float(args.clip_phi_grad) > 0.0:
                 torch.nn.utils.clip_grad_norm_(opt_net.parameters(), max_norm=float(args.clip_phi_grad))
             meta_opt.step()
 
-            # Truncation: detach optimizee params + optimizer states to cut graph
+            # Truncation: detach optimizee params + optimizer states
             params_dict = {k: v.detach().requires_grad_(True) for k, v in params_dict.items()}
             hidden = [h.detach() for h in hidden]
             cell = [c.detach() for c in cell]
 
-            # Log segment metrics
-            seg_loss_avg = seg_loss_sum_det / max(len(batches), 1)
-            seg_acc_avg = seg_correct / max(seg_total, 1)
-
-            epoch_train_loss_sum += seg_loss_sum_det
-            epoch_train_correct += seg_correct
-            epoch_train_total += seg_total
-            epoch_batches += len(batches)
-
-            curve_logger.on_train_step_end(seg_loss_avg, seg_acc_avg)
+            # Segment logging
+            seg_loss_avg = seg_loss_sum / max(seg_total, 1)
+            seg_acc = seg_correct / max(seg_total, 1)
 
             with open(mech_path, "a", encoding="utf-8") as f:
-                # We can approximate update norm from last step's delta_vec_clipped
                 with torch.no_grad():
-                    upd_norm = torch.linalg.vector_norm(delta_vec_clipped.view(-1)).clamp_min(1e-12).item()
-                    clip_coef = float(coef.detach().item())
+                    if last_delta_vec_clipped is None:
+                        upd_norm = 0.0
+                        clip_coef = 1.0
+                    else:
+                        upd_norm = float(torch.linalg.vector_norm(last_delta_vec_clipped.view(-1)).clamp_min(1e-12).item())
+                        clip_coef = float(last_clip_coef.detach().item()) if last_clip_coef is not None else 1.0
                 f.write(
                     f"{global_step},{epoch},{seg_id},{len(batches)},"
-                    f"{float(meta_loss.item()):.8f},{seg_loss_avg:.8f},{seg_acc_avg:.6f},"
+                    f"{float(meta_loss.item()):.8f},{seg_loss_avg:.8f},{seg_acc:.6f},"
                     f"{upd_norm:.6g},{clip_coef:.6g}\n"
                 )
 
             seg_id += 1
 
-        # ---- epoch eval (using current params_dict) ----
-        train_loss_epoch = epoch_train_loss_sum / max(epoch_batches, 1)
-        train_acc_epoch = epoch_train_correct / max(epoch_train_total, 1)
+        # ---- epoch eval ----
+        train_loss_epoch = epoch_loss_sum / max(epoch_total, 1)
+        train_acc_epoch = epoch_correct / max(epoch_total, 1)
 
         val_loss_epoch, val_acc = eval_with_params(net, params_dict, val_eval_loader, device, ce)
         test_loss_epoch, test_acc = eval_with_params(net, params_dict, test_eval_loader, device, ce)
@@ -653,15 +702,14 @@ def main():
                     "time/epoch_sec": epoch_elapsed,
                     "time/total_sec": total_elapsed,
                     "meta/unroll_steps": int(args.unroll_steps),
+                    "meta/detach_grad_input": bool(args.detach_grad_input),
                 }
             )
 
     curve_logger.on_train_end()
     total_time = time.time() - start_time
 
-    # final test
     final_test_loss, final_test_acc = eval_with_params(net, params_dict, test_eval_loader, device, ce)
-
     print(
         f"[RESULT-MNIST1D-MLP-L2O-TRUNC-BPTT] TestAcc={final_test_acc:.4f} "
         f"TestLoss={final_test_loss:.4f} (Total time={total_time/60:.2f} min)"
