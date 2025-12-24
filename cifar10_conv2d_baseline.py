@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Baseline (Conv2D) on CIFAR-10 in PyTorch with wall-clock logging, aligned with F1/F2/F3.
+Baseline (Conv2D) on CIFAR-10 in PyTorch with wall-clock logging,
+aligned with F1/F2/F3 and loader_utils RNG semantics.
 """
 
 import argparse
@@ -15,10 +16,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import Subset
 import torchvision
 from torchvision import transforms
 
+from loader_utils import (
+    LoaderCfg,
+    make_train_val_loaders,
+    make_eval_loader,
+)
 
 # ---------------------- Utilities ----------------------
 def set_seed(seed: int):
@@ -196,8 +202,11 @@ def main():
     ap.add_argument("--data_seed", type=int, default=42)
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--bs", type=int, default=128)
-    ap.add_argument("--preprocess_dir", type=str,
-                    default="artifacts/cifar10_conv2d_preprocess")
+    ap.add_argument(
+        "--preprocess_dir",
+        type=str,
+        default="artifacts/cifar10_conv2d_preprocess",
+    )
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", type=str, default="cifar10_conv2d_baseline")
     ap.add_argument("--wandb_entity", type=str, default=None)
@@ -207,6 +216,7 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # ---------------- data ----------------
     split, norm = load_artifacts(Path(args.preprocess_dir), args.data_seed)
     mean, std = norm["mean"], norm["std"]
 
@@ -215,16 +225,43 @@ def main():
         transforms.Normalize(mean, std),
     ])
 
-    train_full = torchvision.datasets.CIFAR10("data", train=True, download=True, transform=transform)
-    test_dataset = torchvision.datasets.CIFAR10("data", train=False, download=True, transform=transform)
+    train_full = torchvision.datasets.CIFAR10(
+        "data", train=True, download=True, transform=transform
+    )
+    test_dataset = torchvision.datasets.CIFAR10(
+        "data", train=False, download=True, transform=transform
+    )
 
     train_dataset = Subset(train_full, split["train_idx"])
     val_dataset = Subset(train_full, split["val_idx"])
 
-    train_loader = DataLoader(train_dataset, batch_size=args.bs, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=args.bs, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=args.bs, shuffle=False, num_workers=4)
+    # ---------------- loaders (via loader_utils) ----------------
+    cfg = LoaderCfg(
+        batch_size=args.bs,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+    )
 
+    train_loader, val_loader = make_train_val_loaders(
+        train_dataset,
+        val_dataset,
+        cfg,
+        seed=args.seed,
+        train_shuffle=True,
+        val_shuffle=False,      # baseline: epoch-wise validation
+        train_drop_last=True,
+        val_drop_last=False,
+    )
+
+    test_loader = make_eval_loader(
+        test_dataset,
+        batch_size=args.bs,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    # ---------------- model / optim ----------------
     model = Conv2DBaseline().to(device)
 
     if args.opt == "sgd":
@@ -236,6 +273,7 @@ def main():
 
     criterion = nn.CrossEntropyLoss()
 
+    # ---------------- logging ----------------
     run_dir = Path("runs") / f"baseline_conv2d_{args.opt}_seed{args.seed}_dataseed{args.data_seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -255,6 +293,7 @@ def main():
 
     time_logger.start()
 
+    # ---------------- training ----------------
     for epoch in range(args.epochs):
         train_loss, train_acc = train_one_epoch(
             model, device, train_loader, criterion, optimizer, batch_logger, epoch
@@ -294,7 +333,7 @@ def main():
 
     batch_logger.close()
 
-    # -------- final test (unchanged semantics) --------
+    # ---------------- final test ----------------
     final_test_loss, final_test_acc = evaluate(model, device, test_loader, criterion)
 
     with open(run_dir / "result.json", "w") as f:
