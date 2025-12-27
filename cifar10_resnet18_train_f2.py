@@ -23,6 +23,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from data_cifar10 import load_cifar10
+from loader_utils import LoaderCfg, make_train_val_loaders, make_eval_loader
 
 try:
     import wandb  # type: ignore
@@ -344,8 +345,22 @@ def main():
     x_test_t = torch.from_numpy(x_test)
     y_test_t = torch.from_numpy(y_test)
 
-    train_loader = DataLoader(TensorDataset(x_train_t, y_train_t), batch_size=args.bs, shuffle=True, drop_last=True)
-    val_loader = DataLoader(TensorDataset(x_val_t, y_val_t), batch_size=args.bs, shuffle=True, drop_last=True)
+    train_dataset = TensorDataset(x_train_t, y_train_t)
+    val_dataset = TensorDataset(x_val_t, y_val_t)
+    test_dataset = TensorDataset(x_test_t, y_test_t)
+
+    cfg = LoaderCfg(batch_size=args.bs, num_workers=0)
+
+    train_loader, val_loader = make_train_val_loaders(
+        train_dataset,
+        val_dataset,
+        cfg,
+        seed=args.seed,
+        train_shuffle=True,
+        val_shuffle=True,
+        train_drop_last=True,
+        val_drop_last=True,
+    )
 
     def infinite_loader(loader):
         while True:
@@ -354,8 +369,8 @@ def main():
 
     val_iter = infinite_loader(val_loader)
 
-    val_eval_loader = DataLoader(TensorDataset(x_val_t, y_val_t), batch_size=512, shuffle=False)
-    test_eval_loader = DataLoader(TensorDataset(x_test_t, y_test_t), batch_size=512, shuffle=False)
+    val_eval_loader = make_eval_loader(val_dataset, batch_size=512, num_workers=0, pin_memory=False)
+    test_eval_loader = make_eval_loader(test_dataset, batch_size=512, num_workers=0, pin_memory=False)
 
     # models
     net = build_model().to(device)
@@ -418,8 +433,8 @@ def main():
 
             # EMA update: m_t = beta m_{t-1} + (1-beta) g_t
             with torch.no_grad():
-                for i, (m, g) in enumerate(zip(m_buffers, grads)):
-                    m_buffers[i] = args.beta * m + (1.0 - args.beta) * g
+                for m, g in zip(m_buffers, grads):
+                    m.mul_(args.beta).add_(g, alpha=(1.0 - args.beta))
 
             # feature phi = [log||g||, log||m||]
             g_norm = torch.sqrt(sum((g.detach() ** 2).sum() for g in grads) + args.eps)

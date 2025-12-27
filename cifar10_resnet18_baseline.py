@@ -16,6 +16,8 @@ from torch.utils.data import DataLoader, Subset
 import torchvision
 from torchvision import transforms
 
+from loader_utils import LoaderCfg, make_train_val_loaders, make_eval_loader
+
 
 # ---------------------- Utilities ----------------------
 def set_seed(seed: int):
@@ -206,9 +208,25 @@ def main():
     train_dataset = Subset(train_full, split["train_idx"])
     val_dataset = Subset(train_full, split["val_idx"])
 
-    train_loader = DataLoader(train_dataset, batch_size=args.bs, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=args.bs, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=args.bs, shuffle=False, num_workers=4)
+    cfg = LoaderCfg(batch_size=args.bs, num_workers=4)
+
+    train_loader, val_loader = make_train_val_loaders(
+        train_dataset,
+        val_dataset,
+        cfg,
+        seed=args.seed,
+        train_shuffle=True,
+        val_shuffle=False,
+        train_drop_last=False,
+        val_drop_last=False,
+    )
+
+    test_loader = make_eval_loader(
+        test_dataset,
+        batch_size=args.bs,
+        num_workers=4,
+        pin_memory=False,
+    )
 
     model = ResNet18CIFAR().to(device)
 
