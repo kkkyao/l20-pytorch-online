@@ -207,10 +207,18 @@ def main():
         type=str,
         default="artifacts/cifar10_conv2d_preprocess",
     )
+
+    # NEW: output root (to move local saving path)
+    ap.add_argument("--out_root", type=str, default="runs")
+
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", type=str, default="cifar10_conv2d_baseline")
     ap.add_argument("--wandb_entity", type=str, default=None)
     ap.add_argument("--wandb_group", type=str, default=None)
+
+    # NEW: wandb run name override (avoid duplicate names across opts)
+    ap.add_argument("--wandb_run_name", type=str, default=None)
+
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -274,7 +282,7 @@ def main():
     criterion = nn.CrossEntropyLoss()
 
     # ---------------- logging ----------------
-    run_dir = Path("runs") / f"baseline_conv2d_{args.opt}_seed{args.seed}_dataseed{args.data_seed}"
+    run_dir = Path(args.out_root) / f"baseline_conv2d_{args.opt}_seed{args.seed}_dataseed{args.data_seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     time_logger = TimeLogger(run_dir / "time_log.csv")
@@ -288,7 +296,7 @@ def main():
             project=args.wandb_project,
             entity=args.wandb_entity,
             group=args.wandb_group,
-            name=f"baseline_conv2d_seed{args.seed}",
+            name=args.wandb_run_name or f"baseline_conv2d_{args.opt}_seed{args.seed}",
         )
 
     time_logger.start()

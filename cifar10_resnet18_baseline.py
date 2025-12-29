@@ -185,10 +185,18 @@ def main():
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--bs", type=int, default=128)
     ap.add_argument("--preprocess_dir", type=str, default="artifacts/cifar10_conv2d_preprocess")
+
+    # NEW: align with conv2d baseline (local save root)
+    ap.add_argument("--out_root", type=str, default="runs")
+
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", type=str, default="cifar10_resnet18_baseline")
     ap.add_argument("--wandb_entity", type=str, default=None)
     ap.add_argument("--wandb_group", type=str, default=None)
+
+    # NEW: align with conv2d baseline (allow unique run name per opt/seed)
+    ap.add_argument("--wandb_run_name", type=str, default=None)
+
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -208,7 +216,13 @@ def main():
     train_dataset = Subset(train_full, split["train_idx"])
     val_dataset = Subset(train_full, split["val_idx"])
 
-    cfg = LoaderCfg(batch_size=args.bs, num_workers=4)
+    # align loader config defaults with conv2d baseline
+    cfg = LoaderCfg(
+        batch_size=args.bs,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+    )
 
     train_loader, val_loader = make_train_val_loaders(
         train_dataset,
@@ -217,7 +231,7 @@ def main():
         seed=args.seed,
         train_shuffle=True,
         val_shuffle=False,
-        train_drop_last=False,
+        train_drop_last=True,   # align with conv2d baseline
         val_drop_last=False,
     )
 
@@ -225,7 +239,7 @@ def main():
         test_dataset,
         batch_size=args.bs,
         num_workers=4,
-        pin_memory=False,
+        pin_memory=True,        # align with conv2d baseline
     )
 
     model = ResNet18CIFAR().to(device)
@@ -239,7 +253,8 @@ def main():
 
     criterion = nn.CrossEntropyLoss()
 
-    run_dir = Path("runs_resnet18") / f"baseline_resnet18_{args.opt}_seed{args.seed}_dataseed{args.data_seed}"
+    # align run_dir naming/layout with conv2d baseline (under out_root/runs)
+    run_dir = Path(args.out_root) / f"baseline_resnet18_{args.opt}_seed{args.seed}_dataseed{args.data_seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     time_logger = TimeLogger(run_dir / "time_log.csv")
@@ -253,7 +268,7 @@ def main():
             project=args.wandb_project,
             entity=args.wandb_entity,
             group=args.wandb_group,
-            name=f"baseline_resnet18_seed{args.seed}",
+            name=args.wandb_run_name or f"baseline_resnet18_{args.opt}_seed{args.seed}",
         )
 
     time_logger.start()
