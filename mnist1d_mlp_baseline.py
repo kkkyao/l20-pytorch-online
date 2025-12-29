@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Fully-aligned MLP baseline on MNIST-1D.
+
+Alignment guarantees:
+  - Same split / norm artifacts
+  - loader_utils RNG semantics
+  - Local logs: curve.csv / train_log.csv / time_log.csv / result.json
+  - WandB logging aligned with Conv1D / Conv2D / ResNet18 baselines
+"""
 
 import argparse
 import csv
@@ -17,7 +26,7 @@ from data_mnist1d import load_mnist1d
 from loader_utils import LoaderCfg, make_train_val_loaders, make_eval_loader
 
 
-# ---------------------- Utils ----------------------
+# ---------------------- Utilities ----------------------
 def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -60,7 +69,8 @@ class MLPBaseline(nn.Module):
         layers = []
         in_dim = input_len
         for _ in range(num_layers):
-            layers += [nn.Linear(in_dim, hidden_dim), nn.ReLU(inplace=True)]
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.ReLU(inplace=True))
             in_dim = hidden_dim
         self.mlp = nn.Sequential(*layers)
         self.out = nn.Linear(hidden_dim, 10)
@@ -69,19 +79,110 @@ class MLPBaseline(nn.Module):
         return self.out(self.mlp(x))
 
 
+# ---------------------- Loggers ----------------------
+class TimeLogger:
+    def __init__(self, out_csv: Path):
+        self.out_csv = out_csv
+        self.start_time = None
+
+    def start(self):
+        self.start_time = time.time()
+
+    def log_epoch(
+        self,
+        epoch,
+        train_loss, val_loss, test_loss,
+        train_acc, val_acc, test_acc,
+    ):
+        elapsed = time.time() - self.start_time
+        rec = {
+            "epoch": epoch,
+            "elapsed_sec": elapsed,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "test_loss": test_loss,
+            "train_acc": train_acc,
+            "val_acc": val_acc,
+            "test_acc": test_acc,
+        }
+        write_header = not self.out_csv.exists()
+        with open(self.out_csv, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=rec.keys())
+            if write_header:
+                writer.writeheader()
+            writer.writerow(rec)
+
+
+class BatchLossLogger:
+    def __init__(self, csv_path: Path, flush_every: int = 200):
+        self.csv_path = csv_path
+        with open(self.csv_path, "w") as f:
+            f.write("iter,epoch,loss\n")
+        self.iter = 0
+        self.rows = []
+        self.flush_every = flush_every
+
+    def log(self, epoch: int, loss_value: float):
+        self.rows.append([self.iter, epoch, loss_value])
+        self.iter += 1
+        if len(self.rows) >= self.flush_every:
+            self._flush()
+
+    def _flush(self):
+        with open(self.csv_path, "a") as f:
+            writer = csv.writer(f)
+            writer.writerows(self.rows)
+        self.rows.clear()
+
+    def close(self):
+        self._flush()
+
+
+class TrainCSVLogger:
+    def __init__(self, csv_path: Path):
+        self.csv_path = csv_path
+        self.initialized = False
+
+    def log(
+        self,
+        epoch,
+        train_loss, train_acc,
+        val_loss, val_acc,
+        test_loss, test_acc,
+    ):
+        rec = {
+            "epoch": epoch,
+            "loss": train_loss,
+            "accuracy": train_acc,
+            "val_loss": val_loss,
+            "val_accuracy": val_acc,
+            "test_loss": test_loss,
+            "test_accuracy": test_acc,
+        }
+        write_header = not self.initialized
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=rec.keys())
+            if write_header:
+                writer.writeheader()
+            writer.writerow(rec)
+        self.initialized = True
+
+
 # ---------------------- Train / Eval ----------------------
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(model, loader, criterion, optimizer, device, batch_logger, epoch):
     model.train()
     loss_sum, correct, total = 0.0, 0, 0
     for x, y in loader:
-        x = x.to(device, torch.float32)
-        y = y.to(device, torch.long)
+        x = x.to(device=device, dtype=torch.float32)
+        y = y.to(device=device, dtype=torch.long)
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
         optimizer.step()
+
+        batch_logger.log(epoch, loss.item())
 
         bs = y.size(0)
         loss_sum += loss.item() * bs
@@ -96,8 +197,8 @@ def evaluate(model, loader, criterion, device):
     model.eval()
     loss_sum, correct, total = 0.0, 0, 0
     for x, y in loader:
-        x = x.to(device, torch.float32)
-        y = y.to(device, torch.long)
+        x = x.to(device=device, dtype=torch.float32)
+        y = y.to(device=device, dtype=torch.long)
         logits = model(x)
         loss = criterion(logits, y)
 
@@ -126,11 +227,12 @@ def main():
 
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb_entity", type=str, default="leyao-li-epfl")
-    p.add_argument("--wandb_group", type=str, default="mnist1d_mlp_baseline")
+    p.add_argument("--wandb_group", type=str, required=False)
     p.add_argument("--wandb_run_name", type=str, default=None)
 
     args = p.parse_args()
     set_seed(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ---------------- data ----------------
@@ -148,13 +250,16 @@ def main():
     x_test = apply_norm_np(xte, mean, std)
 
     train_ds = TensorDataset(
-        torch.from_numpy(x_train), torch.from_numpy(ytr[split["train_idx"]])
+        torch.from_numpy(x_train),
+        torch.from_numpy(ytr[split["train_idx"]]).long(),
     )
     val_ds = TensorDataset(
-        torch.from_numpy(x_val), torch.from_numpy(ytr[split["val_idx"]])
+        torch.from_numpy(x_val),
+        torch.from_numpy(ytr[split["val_idx"]]).long(),
     )
     test_ds = TensorDataset(
-        torch.from_numpy(x_test), torch.from_numpy(yte)
+        torch.from_numpy(x_test),
+        torch.from_numpy(yte).long(),
     )
 
     cfg = LoaderCfg(batch_size=args.batch_size, num_workers=0)
@@ -166,27 +271,45 @@ def main():
         train_drop_last=True,
         val_drop_last=False,
     )
-    test_loader = make_eval_loader(test_ds, batch_size=args.batch_size, num_workers=0)
+    test_loader = make_eval_loader(
+        test_ds,
+        batch_size=args.batch_size,
+        num_workers=0,
+    )
 
+    # ---------------- model ----------------
     model = MLPBaseline(
         hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers
+        num_layers=args.num_layers,
     ).to(device)
 
     if args.opt == "sgd":
-        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+        optimizer = optim.SGD(
+            model.parameters(),
+            lr=args.lr,
+            momentum=args.momentum,
+        )
     elif args.opt == "adam":
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
     else:
-        optimizer = optim.RMSprop(model.parameters(), lr=args.lr, momentum=args.momentum)
+        optimizer = optim.RMSprop(
+            model.parameters(),
+            lr=args.lr,
+            momentum=args.momentum,
+        )
 
     criterion = nn.CrossEntropyLoss()
 
+    # ---------------- logging ----------------
     run_dir = (
         Path(args.out_root)
         / f"baseline_mlp_{args.opt}_seed{args.seed}_dataseed{args.data_seed}"
     )
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    time_logger = TimeLogger(run_dir / "time_log.csv")
+    batch_logger = BatchLossLogger(run_dir / "curve.csv")
+    train_logger = TrainCSVLogger(run_dir / "train_log.csv")
 
     # ---------------- wandb ----------------
     wandb_run = None
@@ -201,28 +324,31 @@ def main():
             entity=args.wandb_entity,
             group=args.wandb_group,
             name=run_name,
-            config={
-                "dataset": "MNIST-1D",
-                "backbone": "MLP",
-                "method": "baseline",
-                "optimizer": args.opt,
-                "seed": args.seed,
-                "data_seed": args.data_seed,
-                "epochs": args.epochs,
-                "batch_size": args.batch_size,
-                "hidden_dim": args.hidden_dim,
-                "num_layers": args.num_layers,
-                "lr": args.lr,
-            },
+            config=vars(args),
         )
 
+    time_logger.start()
+
     # ---------------- training ----------------
-    for epoch in range(args.epochs):
+    for epoch in range(1, args.epochs + 1):
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
+            model, train_loader, criterion, optimizer, device,
+            batch_logger, epoch,
         )
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
         test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+
+        time_logger.log_epoch(
+            epoch,
+            train_loss, val_loss, test_loss,
+            train_acc, val_acc, test_acc,
+        )
+        train_logger.log(
+            epoch,
+            train_loss, train_acc,
+            val_loss, val_acc,
+            test_loss, test_acc,
+        )
 
         if wandb_run:
             import wandb
@@ -246,8 +372,22 @@ def main():
             f"test_acc={test_acc:.4f}"
         )
 
+    batch_logger.close()
+
+    final_test_loss, final_test_acc = evaluate(
+        model, test_loader, criterion, device
+    )
+
+    result = {
+        "final_test_loss": float(final_test_loss),
+        "final_test_acc": float(final_test_acc),
+    }
+    with open(run_dir / "result.json", "w") as f:
+        json.dump(result, f, indent=2)
+
     if wandb_run:
         import wandb
+        wandb.log(result)
         wandb.finish()
 
 

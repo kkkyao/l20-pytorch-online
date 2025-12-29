@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Baseline (Conv1D) on MNIST-1D implemented in PyTorch with wall-clock logging.
-Aligned with all other baselines / learned runs.
+Baseline (Conv1D) on MNIST-1D with full alignment:
+- loader_utils RNG semantics
+- local CSV logging (curve / train_log / time_log)
+- wandb logging aligned with all baselines / learned runs
 """
 
 import argparse
@@ -41,15 +43,15 @@ def to_N40(x: np.ndarray, length: int = 40) -> np.ndarray:
     raise AssertionError(f"Unexpected x shape: {x.shape}")
 
 
-def apply_norm_np(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    return (x - mean[None, :]) / std[None, :]
+def apply_norm_np(x: np.ndarray, mean: np.ndarray, std: np.ndarray, eps: float = 1e-8):
+    return (x - mean[None, :]) / (std[None, :] + eps)
 
 
 def load_artifacts(preprocess_dir: Path, data_seed: int):
     pdir = preprocess_dir / f"seed_{data_seed}"
-    with open(pdir / "split.json", "r") as f:
+    with open(pdir / "split.json") as f:
         split = json.load(f)
-    with open(pdir / "norm.json", "r") as f:
+    with open(pdir / "norm.json") as f:
         norm = json.load(f)
     return split, norm
 
@@ -76,8 +78,87 @@ class Conv1DMNIST1D(nn.Module):
         return self.fc2(x)
 
 
-# ---------------------- Training helpers ----------------------
-def train_one_epoch(model, loader, criterion, optimizer, device):
+# ---------------------- Loggers ----------------------
+class TimeLogger:
+    def __init__(self, out_csv: Path):
+        self.out_csv = out_csv
+        self.start_time = None
+
+    def start(self):
+        self.start_time = time.time()
+
+    def log_epoch(self, epoch, train_loss, val_loss, test_loss,
+                  train_acc, val_acc, test_acc):
+        rec = {
+            "epoch": epoch,
+            "elapsed_sec": time.time() - self.start_time,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "test_loss": test_loss,
+            "train_acc": train_acc,
+            "val_acc": val_acc,
+            "test_acc": test_acc,
+        }
+        write_header = not self.out_csv.exists()
+        with open(self.out_csv, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=rec.keys())
+            if write_header:
+                writer.writeheader()
+            writer.writerow(rec)
+
+
+class BatchLossLogger:
+    def __init__(self, out_csv: Path, flush_every: int = 200):
+        self.out_csv = out_csv
+        with open(self.out_csv, "w") as f:
+            f.write("iter,epoch,loss\n")
+        self.iter = 0
+        self.rows = []
+        self.flush_every = flush_every
+
+    def log(self, epoch, loss):
+        self.rows.append([self.iter, epoch, loss])
+        self.iter += 1
+        if len(self.rows) >= self.flush_every:
+            self._flush()
+
+    def _flush(self):
+        with open(self.out_csv, "a") as f:
+            writer = csv.writer(f)
+            writer.writerows(self.rows)
+        self.rows.clear()
+
+    def close(self):
+        self._flush()
+
+
+class EpochLogger:
+    def __init__(self, out_csv: Path):
+        self.out_csv = out_csv
+        self.initialized = False
+
+    def log(self, epoch, train_loss, val_loss, test_loss,
+            train_acc, val_acc, test_acc):
+        rec = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "test_loss": test_loss,
+            "test_acc": test_acc,
+        }
+        write_header = not self.initialized
+        with open(self.out_csv, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=rec.keys())
+            if write_header:
+                writer.writeheader()
+            writer.writerow(rec)
+        self.initialized = True
+
+
+# ---------------------- Train / Eval ----------------------
+def train_one_epoch(model, loader, criterion, optimizer, device, batch_logger, epoch):
     model.train()
     loss_sum, correct, total = 0.0, 0, 0
     for x, y in loader:
@@ -90,6 +171,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         loss.backward()
         optimizer.step()
 
+        batch_logger.log(epoch, float(loss.item()))
         loss_sum += loss.item() * y.size(0)
         correct += (logits.argmax(1) == y).sum().item()
         total += y.size(0)
@@ -97,18 +179,18 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
     return loss_sum / total, correct / total
 
 
+@torch.no_grad()
 def evaluate(model, loader, criterion, device):
     model.eval()
     loss_sum, correct, total = 0.0, 0, 0
-    with torch.no_grad():
-        for x, y in loader:
-            x = x.to(device=device, dtype=torch.float32)
-            y = y.to(device=device, dtype=torch.long)
-            logits = model(x)
-            loss = criterion(logits, y)
-            loss_sum += loss.item() * y.size(0)
-            correct += (logits.argmax(1) == y).sum().item()
-            total += y.size(0)
+    for x, y in loader:
+        x = x.to(device=device, dtype=torch.float32)
+        y = y.to(device=device, dtype=torch.long)
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss_sum += loss.item() * y.size(0)
+        correct += (logits.argmax(1) == y).sum().item()
+        total += y.size(0)
     return loss_sum / total, correct / total
 
 
@@ -124,8 +206,8 @@ def main():
     ap.add_argument("--out_root", type=str, default="runs")
 
     ap.add_argument("--wandb", action="store_true")
-    ap.add_argument("--wandb_entity", type=str, default="leyao-li-epfl")
-    ap.add_argument("--wandb_group", type=str, default="mnist1d_conv1d_baseline")
+    ap.add_argument("--wandb_entity", type=str, default=None)
+    ap.add_argument("--wandb_group", type=str, required=False)
     ap.add_argument("--wandb_run_name", type=str, default=None)
 
     args = ap.parse_args()
@@ -172,6 +254,7 @@ def main():
 
     # ---------------- model ----------------
     model = Conv1DMNIST1D().to(device)
+
     if args.opt == "sgd":
         optimizer = optim.SGD(model.parameters(), lr=0.1)
     elif args.opt == "adam":
@@ -187,41 +270,43 @@ def main():
     )
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    time_logger = TimeLogger(run_dir / "time_log.csv")
+    batch_logger = BatchLossLogger(run_dir / "curve.csv")
+    epoch_logger = EpochLogger(run_dir / "train_log.csv")
+
     # ---------------- wandb ----------------
     wandb_run = None
     if args.wandb:
         import wandb
-
         run_name = (
             args.wandb_run_name
             or f"MNIST-1D_Conv1D_baseline_{args.opt}_seed{args.seed}"
         )
-
         wandb_run = wandb.init(
             project="l2o-online(new1)",
             entity=args.wandb_entity,
             group=args.wandb_group,
             name=run_name,
-            config={
-                "dataset": "MNIST-1D",
-                "backbone": "Conv1D",
-                "method": "baseline",
-                "optimizer": args.opt,
-                "seed": args.seed,
-                "data_seed": args.data_seed,
-                "batch_size": args.bs,
-                "epochs": args.epochs,
-            },
+            config=vars(args),
         )
 
-    start_time = time.time()
+    time_logger.start()
 
     for epoch in range(args.epochs):
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
+            model, train_loader, criterion, optimizer, device, batch_logger, epoch
         )
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
         test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+
+        time_logger.log_epoch(
+            epoch, train_loss, val_loss, test_loss,
+            train_acc, val_acc, test_acc
+        )
+        epoch_logger.log(
+            epoch, train_loss, val_loss, test_loss,
+            train_acc, val_acc, test_acc
+        )
 
         if wandb_run:
             import wandb
@@ -238,21 +323,26 @@ def main():
                 step=epoch,
             )
 
-        print(
-            f"[Epoch {epoch}/{args.epochs}] "
-            f"train_acc={train_acc:.4f} "
-            f"val_acc={val_acc:.4f} "
-            f"test_acc={test_acc:.4f}"
-        )
+    batch_logger.close()
 
     final_test_loss, final_test_acc = evaluate(model, test_loader, criterion, device)
+
+    with open(run_dir / "result.json", "w") as f:
+        json.dump(
+            {
+                "final_test_loss": final_test_loss,
+                "final_test_acc": final_test_acc,
+            },
+            f,
+            indent=2,
+        )
 
     if wandb_run:
         import wandb
         wandb.log(
             {
-                "final_test_loss": float(final_test_loss),
-                "final_test_acc": float(final_test_acc),
+                "final_test_loss": final_test_loss,
+                "final_test_acc": final_test_acc,
             }
         )
         wandb.finish()

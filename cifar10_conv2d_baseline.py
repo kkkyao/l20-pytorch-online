@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
 Baseline (Conv2D) on CIFAR-10 in PyTorch with wall-clock logging,
 aligned with F1/F2/F3 and loader_utils RNG semantics.
@@ -183,7 +184,7 @@ def main():
 
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_entity", type=str, default="leyao-li-epfl")
-    ap.add_argument("--wandb_group", type=str, default="cifar10_conv2d_baseline")
+    ap.add_argument("--wandb_group", type=str, required=False)
     ap.add_argument("--wandb_run_name", type=str, default=None)
 
     args = ap.parse_args()
@@ -191,7 +192,6 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---------------- data ----------------
     split, norm = load_artifacts(Path(args.preprocess_dir), args.data_seed)
     mean, std = norm["mean"], norm["std"]
 
@@ -210,7 +210,6 @@ def main():
     train_dataset = Subset(train_full, split["train_idx"])
     val_dataset = Subset(train_full, split["val_idx"])
 
-    # ---------------- loaders ----------------
     cfg = LoaderCfg(
         batch_size=args.bs,
         num_workers=4,
@@ -236,7 +235,6 @@ def main():
         pin_memory=True,
     )
 
-    # ---------------- model ----------------
     model = Conv2DBaseline().to(device)
 
     if args.opt == "sgd":
@@ -248,7 +246,6 @@ def main():
 
     criterion = nn.CrossEntropyLoss()
 
-    # ---------------- local logging ----------------
     run_dir = (
         Path(args.out_root)
         / f"baseline_conv2d_{args.opt}_seed{args.seed}_dataseed{args.data_seed}"
@@ -258,7 +255,6 @@ def main():
     time_logger = TimeLogger(run_dir / "time_log.csv")
     batch_logger = BatchLossLogger(run_dir / "curve.csv")
 
-    # ---------------- wandb ----------------
     wandb_run = None
     if args.wandb:
         import wandb
@@ -287,7 +283,6 @@ def main():
 
     time_logger.start()
 
-    # ---------------- training ----------------
     for epoch in range(args.epochs):
         train_loss, train_acc = train_one_epoch(
             model, device, train_loader, criterion, optimizer, batch_logger, epoch
@@ -302,7 +297,6 @@ def main():
         )
 
         if wandb_run:
-            import wandb
             wandb.log(
                 {
                     "epoch": epoch,
@@ -317,7 +311,7 @@ def main():
             )
 
         print(
-            f"[Epoch {epoch}/{args.epochs}] "
+            f"[Epoch {epoch:03d}] "
             f"train_acc={train_acc:.4f} "
             f"val_acc={val_acc:.4f} "
             f"test_acc={test_acc:.4f}"
@@ -325,11 +319,9 @@ def main():
 
     batch_logger.close()
 
-    # ---------------- final test ----------------
     final_test_loss, final_test_acc = evaluate(model, device, test_loader, criterion)
 
     if wandb_run:
-        import wandb
         wandb.log(
             {
                 "final_test_loss": final_test_loss,
