@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import Subset
 import torchvision
 from torchvision import transforms
 
@@ -43,7 +43,9 @@ class ResNet18CIFAR(nn.Module):
     def __init__(self, num_classes: int = 10):
         super().__init__()
         backbone = torchvision.models.resnet18(pretrained=False)
-        backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        backbone.conv1 = nn.Conv2d(
+            3, 64, kernel_size=3, stride=1, padding=1, bias=False
+        )
         backbone.maxpool = nn.Identity()
         backbone.fc = nn.Linear(backbone.fc.in_features, num_classes)
         self.backbone = backbone
@@ -52,14 +54,8 @@ class ResNet18CIFAR(nn.Module):
         return self.backbone(x)
 
 
-# ---------------------- Loggers ----------------------
+# ---------------------- Loggers (local CSV) ----------------------
 class TimeLogger:
-    """
-    epoch, elapsed_sec,
-    train_loss, val_loss, test_loss,
-    train_acc, val_acc, test_acc
-    """
-
     def __init__(self, out_csv: Path):
         self.out_csv = out_csv
         self.start_time = None
@@ -75,7 +71,7 @@ class TimeLogger:
     ):
         elapsed = time.time() - self.start_time
         rec = {
-            "epoch": epoch + 1,
+            "epoch": epoch,
             "elapsed_sec": elapsed,
             "train_loss": train_loss,
             "val_loss": val_loss,
@@ -117,31 +113,6 @@ class BatchLossLogger:
         self._flush()
 
 
-def append_train_log(
-    csv_path: Path,
-    epoch,
-    train_loss, train_acc,
-    val_loss, val_acc,
-    test_loss, test_acc,
-):
-    write_header = not csv_path.exists()
-    with open(csv_path, "a", newline="") as f:
-        writer = csv.writer(f)
-        if write_header:
-            writer.writerow([
-                "epoch",
-                "loss", "accuracy",
-                "val_loss", "val_accuracy",
-                "test_loss", "test_accuracy",
-            ])
-        writer.writerow([
-            epoch,
-            train_loss, train_acc,
-            val_loss, val_acc,
-            test_loss, test_acc,
-        ])
-
-
 # ---------------------- Train / Eval ----------------------
 def train_one_epoch(model, device, loader, criterion, optimizer, batch_logger, epoch):
     model.train()
@@ -179,6 +150,7 @@ def evaluate(model, device, loader, criterion):
 # ---------------------- Main ----------------------
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--opt", choices=["sgd", "adam", "rmsprop"], default="sgd")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data_seed", type=int, default=42)
@@ -186,15 +158,11 @@ def main():
     ap.add_argument("--bs", type=int, default=128)
     ap.add_argument("--preprocess_dir", type=str, default="artifacts/cifar10_conv2d_preprocess")
 
-    # NEW: align with conv2d baseline (local save root)
     ap.add_argument("--out_root", type=str, default="runs")
 
     ap.add_argument("--wandb", action="store_true")
-    ap.add_argument("--wandb_project", type=str, default="cifar10_resnet18_baseline")
-    ap.add_argument("--wandb_entity", type=str, default=None)
-    ap.add_argument("--wandb_group", type=str, default=None)
-
-    # NEW: align with conv2d baseline (allow unique run name per opt/seed)
+    ap.add_argument("--wandb_entity", type=str, default="leyao-li-epfl")
+    ap.add_argument("--wandb_group", type=str, default="cifar10_resnet18_baseline")
     ap.add_argument("--wandb_run_name", type=str, default=None)
 
     args = ap.parse_args()
@@ -210,13 +178,16 @@ def main():
         transforms.Normalize(mean, std),
     ])
 
-    train_full = torchvision.datasets.CIFAR10("data", train=True, download=True, transform=transform)
-    test_dataset = torchvision.datasets.CIFAR10("data", train=False, download=True, transform=transform)
+    train_full = torchvision.datasets.CIFAR10(
+        "data", train=True, download=True, transform=transform
+    )
+    test_dataset = torchvision.datasets.CIFAR10(
+        "data", train=False, download=True, transform=transform
+    )
 
     train_dataset = Subset(train_full, split["train_idx"])
     val_dataset = Subset(train_full, split["val_idx"])
 
-    # align loader config defaults with conv2d baseline
     cfg = LoaderCfg(
         batch_size=args.bs,
         num_workers=4,
@@ -231,7 +202,7 @@ def main():
         seed=args.seed,
         train_shuffle=True,
         val_shuffle=False,
-        train_drop_last=True,   # align with conv2d baseline
+        train_drop_last=True,
         val_drop_last=False,
     )
 
@@ -239,7 +210,7 @@ def main():
         test_dataset,
         batch_size=args.bs,
         num_workers=4,
-        pin_memory=True,        # align with conv2d baseline
+        pin_memory=True,
     )
 
     model = ResNet18CIFAR().to(device)
@@ -253,22 +224,39 @@ def main():
 
     criterion = nn.CrossEntropyLoss()
 
-    # align run_dir naming/layout with conv2d baseline (under out_root/runs)
-    run_dir = Path(args.out_root) / f"baseline_resnet18_{args.opt}_seed{args.seed}_dataseed{args.data_seed}"
+    run_dir = (
+        Path(args.out_root)
+        / f"baseline_resnet18_{args.opt}_seed{args.seed}_dataseed{args.data_seed}"
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
 
     time_logger = TimeLogger(run_dir / "time_log.csv")
     batch_logger = BatchLossLogger(run_dir / "curve.csv")
-    train_log_csv = run_dir / "train_log.csv"
 
     wandb_run = None
     if args.wandb:
         import wandb
+
+        run_name = (
+            args.wandb_run_name
+            or f"CIFAR-10_ResNet18_baseline_{args.opt}_seed{args.seed}"
+        )
+
         wandb_run = wandb.init(
-            project=args.wandb_project,
+            project="l2o-online(new1)",
             entity=args.wandb_entity,
             group=args.wandb_group,
-            name=args.wandb_run_name or f"baseline_resnet18_{args.opt}_seed{args.seed}",
+            name=run_name,
+            config={
+                "dataset": "CIFAR-10",
+                "backbone": "ResNet18",
+                "method": "baseline",
+                "optimizer": args.opt,
+                "seed": args.seed,
+                "data_seed": args.data_seed,
+                "batch_size": args.bs,
+                "epochs": args.epochs,
+            },
         )
 
     time_logger.start()
@@ -285,48 +273,41 @@ def main():
             train_loss, val_loss, test_loss,
             train_acc, val_acc, test_acc,
         )
-        append_train_log(
-            train_log_csv,
-            epoch,
-            train_loss, train_acc,
-            val_loss, val_acc,
-            test_loss, test_acc,
-        )
 
         if wandb_run:
             import wandb
-            wandb.log({
-                "epoch": epoch + 1,
-                "train_loss": train_loss,
-                "train_acc": train_acc,
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-                "test_loss": test_loss,
-                "test_acc": test_acc,
-            })
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "train_acc": train_acc,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "test_loss": test_loss,
+                    "test_acc": test_acc,
+                },
+                step=epoch,
+            )
 
         print(
-            f"[Epoch {epoch+1}/{args.epochs}] "
-            f"train={train_acc:.3f} val={val_acc:.3f} test={test_acc:.3f}"
+            f"[Epoch {epoch}/{args.epochs}] "
+            f"train_acc={train_acc:.4f} "
+            f"val_acc={val_acc:.4f} "
+            f"test_acc={test_acc:.4f}"
         )
 
     batch_logger.close()
 
-    # -------- final test (unchanged semantics) --------
     final_test_loss, final_test_acc = evaluate(model, device, test_loader, criterion)
-
-    with open(run_dir / "result.json", "w") as f:
-        json.dump({
-            "test_loss": final_test_loss,
-            "test_acc": final_test_acc,
-        }, f, indent=2)
 
     if wandb_run:
         import wandb
-        wandb.log({
-            "final_test_loss": final_test_loss,
-            "final_test_acc": final_test_acc,
-        })
+        wandb.log(
+            {
+                "final_test_loss": final_test_loss,
+                "final_test_acc": final_test_acc,
+            }
+        )
         wandb.finish()
 
 
