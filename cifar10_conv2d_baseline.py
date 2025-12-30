@@ -97,9 +97,9 @@ class TimeLogger:
             "epoch": epoch,
             "elapsed_sec": elapsed,
             "train_loss": train_loss,
+            "train_acc": train_acc,
             "val_loss": val_loss,
             "test_loss": test_loss,
-            "train_acc": train_acc,
             "val_acc": val_acc,
             "test_acc": test_acc,
         }
@@ -139,7 +139,7 @@ class BatchLossLogger:
 # ---------------------- Train / Eval ----------------------
 def train_one_epoch(model, device, loader, criterion, optimizer, batch_logger, epoch):
     model.train()
-    loss_sum, correct, total = 0.0, 0, 0
+    loss_sum, batch_cnt, correct, total = 0.0, 0, 0, 0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
@@ -149,25 +149,26 @@ def train_one_epoch(model, device, loader, criterion, optimizer, batch_logger, e
         optimizer.step()
 
         batch_logger.log(epoch, loss.item())
-        loss_sum += loss.item() * y.size(0)
+        loss_sum += loss.item()
+        batch_cnt += 1
         correct += out.argmax(1).eq(y).sum().item()
         total += y.size(0)
-    return loss_sum / total, correct / total
+    return loss_sum / max(batch_cnt, 1), correct / total
 
 
 def evaluate(model, device, loader, criterion):
     model.eval()
-    loss_sum, correct, total = 0.0, 0, 0
+    loss_sum, batch_cnt, correct, total = 0.0, 0, 0, 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             out = model(x)
             loss = criterion(out, y)
-            loss_sum += loss.item() * y.size(0)
+            loss_sum += loss.item()
+            batch_cnt += 1
             correct += out.argmax(1).eq(y).sum().item()
             total += y.size(0)
-    return loss_sum / total, correct / total
-
+    return loss_sum / max(batch_cnt, 1), correct / total
 
 # ---------------------- Main ----------------------
 def main():
