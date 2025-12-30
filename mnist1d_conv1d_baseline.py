@@ -21,7 +21,6 @@ from torch.utils.data import TensorDataset
 
 from data_mnist1d import load_mnist1d
 from loader_utils import LoaderCfg, make_train_val_loaders, make_eval_loader
-from utils.plot_exporter import export_plot_files
 
 
 # ---------------------- Utilities ----------------------
@@ -88,16 +87,12 @@ class TimeLogger:
     def start(self):
         self.start_time = time.time()
 
-    def log_epoch(self, epoch, train_loss, val_loss, test_loss,
-                  train_acc, val_acc, test_acc):
+    def log_epoch(self, train_loss, train_acc, test_loss, test_acc):
         rec = {
-            "epoch": epoch,
             "elapsed_sec": time.time() - self.start_time,
             "train_loss": train_loss,
-            "val_loss": val_loss,
-            "test_loss": test_loss,
             "train_acc": train_acc,
-            "val_acc": val_acc,
+            "test_loss": test_loss,
             "test_acc": test_acc,
         }
         write_header = not self.out_csv.exists()
@@ -138,14 +133,12 @@ class EpochLogger:
         self.out_csv = out_csv
         self.initialized = False
 
-    def log(self, epoch, train_loss, val_loss, test_loss,
-            train_acc, val_acc, test_acc):
+    def log(self, epoch, train_loss, train_acc, test_loss, test_acc):
+            
         rec = {
             "epoch": epoch,
             "train_loss": train_loss,
             "train_acc": train_acc,
-            "val_loss": val_loss,
-            "val_acc": val_acc,
             "test_loss": test_loss,
             "test_acc": test_acc,
         }
@@ -310,12 +303,13 @@ def main():
         test_loss, test_acc = evaluate(model, test_loader, criterion, device)
 
         time_logger.log_epoch(
-            epoch, train_loss, val_loss, test_loss,
-            train_acc, val_acc, test_acc
+            train_loss, train_acc,
+            test_loss, test_acc,
         )
         epoch_logger.log(
-            epoch, train_loss, val_loss, test_loss,
-            train_acc, val_acc, test_acc
+            epoch,
+            train_loss, train_acc,
+            test_loss, test_acc,
         )
 
         if wandb_run:
@@ -340,8 +334,12 @@ def main():
     with open(run_dir / "result.json", "w") as f:
         json.dump(
             {
+                "seed": args.seed,
+                "data_seed": args.data_seed,
+                "epochs": args.epochs,
                 "final_test_loss": final_test_loss,
                 "final_test_acc": final_test_acc,
+                "elapsed_sec": time.time() - time_logger.start_time
             },
             f,
             indent=2,
@@ -356,17 +354,7 @@ def main():
             }
         )
         wandb.finish()
-    # ---------------- export paper-level plot files ----------------
-    export_plot_files(
-        run_dir=run_dir,
-        dataset="mnist1d",
-        model="conv1d",
-        method="baseline",
-        seed=args.seed,
-        data_seed=args.data_seed,
-        epochs=args.epochs,
-        optimizer=args.opt,
-    )
+    
 
 
 if __name__ == "__main__":
