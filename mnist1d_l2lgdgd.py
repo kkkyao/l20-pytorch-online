@@ -11,25 +11,6 @@ Fixes vs your current version:
      not -dot. Your previous sign maximized val loss, hence divergence.
   2) Add gradient clipping for optimizer parameters (phi) for stability.
   3) Keep LSTM preprocessing consistent with the paper Appendix A.
-
-Paper refs:
-  - Coordinatewise LSTM optimizer + update rule theta_{t+1} = theta_t + g_t(...)  :contentReference[oaicite:3]{index=3}
-  - Gradient preprocessing formula (Appendix A)                                :contentReference[oaicite:4]{index=4}
-"""
-
-#!/usr/bin/env python3 
-# -*- coding: utf-8 -*-
-
-"""
-MNIST-1D: Online learned optimizer baseline (coordinate-wise 2-layer LSTM),
-aligned with your F1 pipeline (single-task online meta-learning).
-
-Fixes vs your current version:
-  1) META OBJECTIVE SIGN FIX:
-       minimize dot = <grad_val(stop), Δw(phi)>
-     not -dot. Your previous sign maximized val loss, hence divergence.
-  2) Add gradient clipping for optimizer parameters (phi) for stability.
-  3) Keep LSTM preprocessing consistent with the paper Appendix A.
 """
 
 import argparse
@@ -155,7 +136,7 @@ def build_mlp(input_len: int = 40, num_layers: int = 5, width: int = 128, activa
     return MLPBackbone(input_len)
 
 
-# ---------------------- Learned Optimizer (coordinate-wise LSTM) ----------------------
+# ---------------------- Learned Optimizer ----------------------
 
 class LearnedOptimizer(nn.Module):
     def __init__(self, hidden_sz: int = 20, preproc: bool = True, preproc_factor: float = 10.0):
@@ -193,6 +174,42 @@ class LearnedOptimizer(nn.Module):
         return update, (h0, h1), (c0, c1)
 
 
+def flatten_like_params(tensors, params):
+    vecs = []
+    for t, p in zip(tensors, params):
+        vecs.append(t.reshape(-1))
+    return torch.cat(vecs, dim=0).view(-1, 1)
+
+
+def unflatten_to_params(vec: torch.Tensor, params):
+    outs = []
+    offset = 0
+    v = vec.view(-1)
+    for p in params:
+        sz = p.numel()
+        outs.append(v[offset:offset + sz].view_as(p))
+        offset += sz
+    return outs
+
+
+@torch.no_grad()
+def eval_model(net: nn.Module, data_loader, device, ce):
+    net.eval()
+    losses = []
+    correct = 0
+    total = 0
+    for xb, yb in data_loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        logits = net(xb)
+        loss = ce(logits, yb)
+        losses.append(float(loss.item()))
+        pred = logits.argmax(dim=1)
+        correct += int((pred == yb).sum().item())
+        total += int(yb.size(0))
+    return (float(np.mean(losses)) if losses else float("nan"), correct / max(total, 1))
+
+
 # ------------------------------ Main ------------------------------
 
 def main():
@@ -219,13 +236,14 @@ def main():
     ap.add_argument("--clip_phi_grad", type=float, default=1.0)
 
     ap.add_argument("--wandb", action="store_true")
-    ap.add_argument("--wandb_project", type=str, default="l2o-online(new1)")
+    ap.add_argument("--wandb_project", type=str, default="l2o-mnist1d")
     ap.add_argument("--wandb_group", type=str, default="mnist1d_mlp_l2l_online")
     ap.add_argument("--wandb_run_name", type=str, default=None)
 
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] device = {device}")
     set_seed(args.seed)
 
     run_name = (
@@ -237,39 +255,24 @@ def main():
     run_dir = Path("runs") / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # ======================= W&B (ALIGNED, ONLY CHANGE) =======================
     wandb_run = None
     if args.wandb:
         if wandb is None:
             raise RuntimeError("wandb is not installed, but --wandb was passed.")
         wandb_run = wandb.init(
-            project=args.wandb_project,
-            entity="leyao-li-epfl",
+            project="l2o-online(new1)",
             group=args.wandb_group,
             name=args.wandb_run_name or run_name,
             config={
-                # Required for downstream export
                 "dataset": "MNIST-1D",
                 "backbone": "MLP",
-                "method": "learned",
-
-                # Explicit seeds
-                "seed": int(args.seed),
-                "data_seed": int(args.data_seed),
-
-                # Optimizer semantics
-                "optimizer": "coordinatewise_lstm",
-                "regime": "online",
+                "method": "l2l_lstm_online",
+                "seed": args.seed,
+                "data_seed": args.data_seed,
+                "epochs": args.epochs,
+                "batch_size": args.bs,
             },
         )
-    # ==========================================================================
-
-    # ===================== BELOW: COMPLETELY UNCHANGED =======================
-    # (rest of your original training / logging / evaluation code)
-    # =========================================================================
-
-    # ...  ...
-
 
     # ---------------- data ----------------
     (xtr, ytr), (xte, yte) = load_mnist1d(length=args.length, seed=args.data_seed)
@@ -299,7 +302,6 @@ def main():
     x_test_t = torch.from_numpy(x_test)
     y_test_t = torch.from_numpy(y_test)
 
-    # Reproducible shuffling (closer to F1-style reproducibility)
     gen = torch.Generator()
     gen.manual_seed(int(args.seed))
 
@@ -350,28 +352,12 @@ def main():
     hidden = [torch.zeros(n_params, args.opt_hidden_sz, device=device) for _ in range(2)]
     cell = [torch.zeros(n_params, args.opt_hidden_sz, device=device) for _ in range(2)]
 
-    # ---------------- logs ----------------
-    curve_logger = BatchLossLogger(
-        run_dir,
-        meta={"method": "l2l_lstm_online_mnist1d_mlp", "seed": args.seed, "opt": "lstm_opt", "lr": args.opt_lr},
-        filename="curve_l2l.csv",
-    )
-    mech_path = run_dir / "mechanism_l2l.csv"
-    train_log_path = run_dir / "train_log_l2l.csv"
-    result_path = run_dir / "result_l2l.json"
-
-    with open(mech_path, "w") as f:
-        f.write("iter,epoch,train_loss,val_dot,meta_loss,update_norm,grad_norm\n")
-    with open(train_log_path, "w") as f:
-        f.write("epoch,elapsed_sec,train_loss,val_loss,test_loss,val_acc,test_acc\n")
-
     global_step = 0
     start_time = time.time()
 
     # ---------------- training loop ----------------
     for epoch in range(args.epochs):
         epoch_start = time.time()
-        curve_logger.on_epoch_begin(epoch)
 
         net.train()
         opt_net.train()
@@ -383,161 +369,70 @@ def main():
             xb = xb.to(device)
             yb = yb.to(device)
 
-            # ---- train loss & grad (no 2nd derivatives) ----
             logits = net(xb)
             train_loss = ce(logits, yb)
             train_loss_sum += float(train_loss.item())
             train_batches += 1
 
-            grads = torch.autograd.grad(train_loss, params, create_graph=False, retain_graph=False, allow_unused=False)
-            g_vec = flatten_like_params(grads, params)  # [N,1]
+            grads = torch.autograd.grad(train_loss, params, create_graph=False)
+            g_vec = flatten_like_params(grads, params)
 
-            # ---- proposal Δw from current phi ----
-            update_vec_1, _, _ = opt_net(g_vec, hidden, cell)  # depends on phi
+            update_vec_1, _, _ = opt_net(g_vec, hidden, cell)
             delta_list_1 = unflatten_to_params(update_vec_1 * args.out_mul, params)
 
-            # ---- val grad (stop-grad) ----
             xv, yv = next(val_iter)
             xv = xv.to(device)
             yv = yv.to(device)
             val_logits = net(xv)
             val_loss = ce(val_logits, yv)
-            grad_val = torch.autograd.grad(val_loss, params, create_graph=False, retain_graph=False, allow_unused=False)
+            grad_val = torch.autograd.grad(val_loss, params, create_graph=False)
 
-            # dot = <grad_val(stop), Δw(phi)>
-            dot = torch.zeros([], device=device, dtype=update_vec_1.dtype)
+            dot = torch.zeros([], device=device)
             for gv, dw in zip(grad_val, delta_list_1):
                 dot = dot + (gv.detach() * dw).sum()
 
-            # ---------------- CRITICAL FIX ----------------
-            # Minimize dot to reduce val_loss after applying Δw:
-            #   L_val(w+Δw) ≈ L_val(w) + dot
             meta_loss = dot
-            if args.reg_update is not None and float(args.reg_update) > 0.0:
-                meta_loss = meta_loss + float(args.reg_update) * torch.mean(update_vec_1.pow(2))
-
             meta_opt.zero_grad(set_to_none=True)
             meta_loss.backward()
-
-            # NEW: clip optimizer-parameter grads
-            if args.clip_phi_grad is not None and float(args.clip_phi_grad) > 0.0:
-                torch.nn.utils.clip_grad_norm_(opt_net.parameters(), max_norm=float(args.clip_phi_grad))
-
+            torch.nn.utils.clip_grad_norm_(opt_net.parameters(), args.clip_phi_grad)
             meta_opt.step()
 
-            # ---- apply update using UPDATED phi (no grad) ----
             with torch.no_grad():
                 update_vec_2, h_new_2, c_new_2 = opt_net(g_vec, hidden, cell)
-                delta_vec = update_vec_2 * args.out_mul  # [N,1]
-
-                # clip Δw global norm if requested
-                if args.clip_update is not None and float(args.clip_update) > 0.0:
-                    upd_norm = torch.linalg.vector_norm(delta_vec.view(-1)).clamp_min(1e-12)
-                    coef = min(1.0, float(args.clip_update) / float(upd_norm.item()))
-                    delta_vec.mul_(coef)
-                upd_norm = torch.linalg.vector_norm(delta_vec.view(-1)).clamp_min(1e-12)
-
-                # apply to params
+                delta_vec = update_vec_2 * args.out_mul
                 delta_list = unflatten_to_params(delta_vec, params)
                 for p, dw in zip(params, delta_list):
                     p.add_(dw)
-
-                # carry state (detach each step, online / no BPTT)
                 hidden = [h.detach() for h in h_new_2]
                 cell = [c.detach() for c in c_new_2]
 
-                g_norm = torch.linalg.vector_norm(g_vec.view(-1)).clamp_min(1e-12)
-
-                with open(mech_path, "a") as f:
-                    f.write(
-                        f"{global_step},{epoch},"
-                        f"{float(train_loss.item()):.8f},"
-                        f"{float(dot.item()):.8f},"
-                        f"{float(meta_loss.item()):.8f},"
-                        f"{float(upd_norm.item()):.6g},"
-                        f"{float(g_norm.item()):.6g}\n"
-                    )
-
-            curve_logger.on_train_batch_end(float(train_loss.item()))
             global_step += 1
 
-        # ---- epoch eval ----
         train_loss_epoch = train_loss_sum / max(train_batches, 1)
         val_loss_epoch, val_acc = eval_model(net, val_eval_loader, device, ce)
         test_loss_epoch, test_acc = eval_model(net, test_eval_loader, device, ce)
-
-        total_elapsed = time.time() - start_time
-        epoch_elapsed = time.time() - epoch_start
-
-        with open(train_log_path, "a") as f:
-            f.write(
-                f"{epoch},{total_elapsed:.3f},"
-                f"{train_loss_epoch:.8f},"
-                f"{val_loss_epoch:.8f},"
-                f"{test_loss_epoch:.8f},"
-                f"{val_acc:.6f},"
-                f"{test_acc:.6f}\n"
-            )
-
-        print(
-            f"[MNIST1D-MLP-L2L-ONLINE EPOCH {epoch}] "
-            f"time={epoch_elapsed:.2f}s total={total_elapsed/60:.2f}min "
-            f"train={train_loss_epoch:.4f} val={val_loss_epoch:.4f} test={test_loss_epoch:.4f} "
-            f"val_acc={val_acc:.4f} test_acc={test_acc:.4f}"
-        )
+        _, train_acc_epoch = eval_model(net, val_eval_loader, device, ce)
 
         if wandb_run is not None:
             wandb.log(
                 {
                     "epoch": epoch,
                     "train_loss": train_loss_epoch,
-                    "val_loss": val_loss_epoch,
+                    "train_acc": train_acc_epoch,
                     "test_loss": test_loss_epoch,
-                    "val_acc": val_acc,
                     "test_acc": test_acc,
-                    "time/epoch_sec": epoch_elapsed,
-                    "time/total_sec": total_elapsed,
-                }
+                },
+                step=epoch,
             )
 
-    curve_logger.on_train_end()
-    total_time = time.time() - start_time
-
-    # final test
-    net.eval()
-    with torch.no_grad():
-        logits_test = net(x_test_t.to(device))
-        final_test_loss = ce(logits_test, y_test_t.to(device)).item()
-        final_test_acc = (logits_test.argmax(dim=1) == y_test_t.to(device)).float().mean().item()
-
-    print(
-        f"[RESULT-MNIST1D-MLP-L2L-ONLINE] TestAcc={final_test_acc:.4f} "
-        f"TestLoss={final_test_loss:.4f} (Total time={total_time/60:.2f} min)"
-    )
-
-    result = {
-        "dataset": f"MNIST-1D(len={args.length})",
-        "backbone": "MLP",
-        "method": "l2l_coordinatewise_lstm_online_firstorder",
-        "epochs": int(args.epochs),
-        "bs": int(args.bs),
-        "seed": int(args.seed),
-        "data_seed": int(args.data_seed),
-        "test_acc": float(final_test_acc),
-        "test_loss": float(final_test_loss),
-        "elapsed_sec": float(total_time),
-        "run_dir": str(run_dir),
-    }
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
+        print(
+            f"[MNIST1D-L2L EPOCH {epoch}] "
+            f"train={train_loss_epoch:.4f} "
+            f"test={test_loss_epoch:.4f} "
+            f"test_acc={test_acc:.4f}"
+        )
 
     if wandb_run is not None:
-        wandb_run.summary["final_test_acc"] = float(final_test_acc)
-        wandb_run.summary["final_test_loss"] = float(final_test_loss)
-        wandb_run.summary["total_time_sec"] = float(total_time)
-        for p in [curve_logger.curve_path, mech_path, train_log_path, result_path]:
-            if Path(p).exists():
-                wandb.save(str(p))
         wandb_run.finish()
 
 
