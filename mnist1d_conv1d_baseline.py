@@ -21,6 +21,7 @@ from torch.utils.data import TensorDataset
 
 from data_mnist1d import load_mnist1d
 from loader_utils import LoaderCfg, make_train_val_loaders, make_eval_loader
+from utils.plot_exporter import export_plot_files
 
 
 # ---------------------- Utilities ----------------------
@@ -355,6 +356,17 @@ def main():
             }
         )
         wandb.finish()
+    # ---------------- export paper-level plot files ----------------
+    export_plot_files(
+        run_dir=run_dir,
+        dataset="mnist1d",
+        model="conv1d",
+        method="baseline",
+        seed=args.seed,
+        data_seed=args.data_seed,
+        epochs=args.epochs,
+        optimizer=args.opt,
+    )
 
 
 if __name__ == "__main__":
