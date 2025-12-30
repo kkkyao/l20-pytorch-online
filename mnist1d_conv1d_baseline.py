@@ -207,7 +207,7 @@ def main():
 
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_entity", type=str, default=None)
-    ap.add_argument("--wandb_group", type=str, required=False)
+    ap.add_argument("--wandb_group", type=str, default=None)
     ap.add_argument("--wandb_run_name", type=str, default=None)
 
     args = ap.parse_args()
@@ -274,20 +274,29 @@ def main():
     batch_logger = BatchLossLogger(run_dir / "curve.csv")
     epoch_logger = EpochLogger(run_dir / "train_log.csv")
 
-    # ---------------- wandb ----------------
+    # ---------------- wandb (关键修复点) ----------------
     wandb_run = None
     if args.wandb:
         import wandb
+
         run_name = (
             args.wandb_run_name
             or f"MNIST-1D_Conv1D_baseline_{args.opt}_seed{args.seed}"
         )
+
+        wandb_cfg = dict(vars(args))
+        wandb_cfg.update({
+            "dataset": "MNIST-1D",
+            "backbone": "Conv1D",
+            "method": "baseline",
+        })
+
         wandb_run = wandb.init(
             project="l2o-online(new1)",
             entity=args.wandb_entity,
             group=args.wandb_group,
             name=run_name,
-            config=vars(args),
+            config=wandb_cfg,
         )
 
     time_logger.start()

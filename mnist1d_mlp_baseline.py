@@ -311,20 +311,29 @@ def main():
     batch_logger = BatchLossLogger(run_dir / "curve.csv")
     train_logger = TrainCSVLogger(run_dir / "train_log.csv")
 
-    # ---------------- wandb ----------------
+    # ---------------- wandb (关键修复在这里) ----------------
     wandb_run = None
     if args.wandb:
         import wandb
+
         run_name = (
             args.wandb_run_name
             or f"MNIST-1D_MLP_baseline_{args.opt}_seed{args.seed}"
         )
+
+        wandb_cfg = dict(vars(args))
+        wandb_cfg.update({
+            "dataset": "MNIST-1D",
+            "backbone": "MLP",
+            "method": "baseline",
+        })
+
         wandb_run = wandb.init(
             project="l2o-online(new1)",
             entity=args.wandb_entity,
             group=args.wandb_group,
             name=run_name,
-            config=vars(args),
+            config=wandb_cfg,
         )
 
     time_logger.start()
