@@ -54,41 +54,36 @@ class ResNet18CIFAR(nn.Module):
         return self.backbone(x)
 
 
-# ---------------------- Loggers (local CSV) ----------------------
+# ---------------------- Loggers ----------------------
 class TimeLogger:
+    """
+    Checklist-aligned time-based logger.
+    Schema:
+      elapsed_sec,train_loss,train_acc,test_loss,test_acc
+    """
     def __init__(self, out_csv: Path):
         self.out_csv = out_csv
         self.start_time = None
+        with open(self.out_csv, "w") as f:
+            f.write("elapsed_sec,train_loss,train_acc,test_loss,test_acc\n")
 
     def start(self):
         self.start_time = time.time()
 
-    def log_epoch(
-        self,
-        epoch,
-        train_loss, val_loss, test_loss,
-        train_acc, val_acc, test_acc,
-    ):
+    def log_epoch(self, train_loss, train_acc, test_loss, test_acc):
         elapsed = time.time() - self.start_time
-        rec = {
-            "epoch": epoch,
-            "elapsed_sec": elapsed,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "test_loss": test_loss,
-            "train_acc": train_acc,
-            "val_acc": val_acc,
-            "test_acc": test_acc,
-        }
-        write_header = not self.out_csv.exists()
-        with open(self.out_csv, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=rec.keys())
-            if write_header:
-                writer.writeheader()
-            writer.writerow(rec)
+        with open(self.out_csv, "a") as f:
+            f.write(
+                f"{elapsed:.3f},"
+                f"{train_loss:.8f},{train_acc:.6f},"
+                f"{test_loss:.8f},{test_acc:.6f}\n"
+            )
 
 
 class BatchLossLogger:
+    """
+    Batch-level training loss curve (auxiliary file, not in checklist)
+    """
     def __init__(self, csv_path: Path, flush_every: int = 200):
         self.csv_path = csv_path
         with open(self.csv_path, "w") as f:
@@ -157,7 +152,6 @@ def main():
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--bs", type=int, default=128)
     ap.add_argument("--preprocess_dir", type=str, default="artifacts/cifar10_conv2d_preprocess")
-
     ap.add_argument("--out_root", type=str, default="runs")
 
     ap.add_argument("--wandb", action="store_true")
@@ -230,18 +224,19 @@ def main():
     )
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- checklist loggers ---
     time_logger = TimeLogger(run_dir / "time_log.csv")
     batch_logger = BatchLossLogger(run_dir / "curve.csv")
 
+    train_log_path = run_dir / "train_log.csv"
+    with open(train_log_path, "w") as f:
+        f.write("epoch,train_loss,train_acc,test_loss,test_acc\n")
+
+    # --- wandb ---
     wandb_run = None
     if args.wandb:
         import wandb
-
-        run_name = (
-            args.wandb_run_name
-            or f"CIFAR-10_ResNet18_baseline_{args.opt}_seed{args.seed}"
-        )
-
+        run_name = args.wandb_run_name or f"CIFAR-10_ResNet18_baseline_{args.opt}_seed{args.seed}"
         wandb_run = wandb.init(
             project="l2o-online(new1)",
             entity=args.wandb_entity,
@@ -265,14 +260,20 @@ def main():
         train_loss, train_acc = train_one_epoch(
             model, device, train_loader, criterion, optimizer, batch_logger, epoch
         )
-        val_loss, val_acc = evaluate(model, device, val_loader, criterion)
         test_loss, test_acc = evaluate(model, device, test_loader, criterion)
 
+        # --- checklist logs ---
         time_logger.log_epoch(
-            epoch,
-            train_loss, val_loss, test_loss,
-            train_acc, val_acc, test_acc,
+            train_loss, train_acc,
+            test_loss, test_acc,
         )
+
+        with open(train_log_path, "a") as f:
+            f.write(
+                f"{epoch},"
+                f"{train_loss:.8f},{train_acc:.6f},"
+                f"{test_loss:.8f},{test_acc:.6f}\n"
+            )
 
         if wandb_run:
             import wandb
@@ -281,8 +282,6 @@ def main():
                     "epoch": epoch,
                     "train_loss": train_loss,
                     "train_acc": train_acc,
-                    "val_loss": val_loss,
-                    "val_acc": val_acc,
                     "test_loss": test_loss,
                     "test_acc": test_acc,
                 },
@@ -292,13 +291,28 @@ def main():
         print(
             f"[Epoch {epoch}/{args.epochs}] "
             f"train_acc={train_acc:.4f} "
-            f"val_acc={val_acc:.4f} "
             f"test_acc={test_acc:.4f}"
         )
 
     batch_logger.close()
 
     final_test_loss, final_test_acc = evaluate(model, device, test_loader, criterion)
+
+    result = {
+        "dataset": "CIFAR-10",
+        "backbone": "ResNet18",
+        "method": f"baseline_{args.opt}",
+        "seed": args.seed,
+        "data_seed": args.data_seed,
+        "epochs": args.epochs,
+        "final_test_loss": float(final_test_loss),
+        "final_test_acc": float(final_test_acc),
+        "elapsed_sec": float(time.time() - time_logger.start_time),
+        "run_dir": str(run_dir),
+    }
+
+    with open(run_dir / "result.json", "w") as f:
+        json.dump(result, f, indent=2)
 
     if wandb_run:
         import wandb

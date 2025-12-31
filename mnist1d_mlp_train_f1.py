@@ -66,7 +66,7 @@ class BatchLossLogger:
         self.curr_epoch = 0
         self.rows = []
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.curve_path = self.run_dir / "curve_f1.csv"
+        self.curve_path = self.run_dir / "curve.csv"
         with open(self.curve_path, "w") as f:
             f.write("iter,epoch,loss,method,seed,opt,lr\n")
 
@@ -425,17 +425,17 @@ def main():
             "lr": args.theta_lr,
         },
     )
-    mech_path = run_dir / "mechanism_f1.csv"
-    train_log_path = run_dir / "train_log_f1.csv"
-    time_log_path = run_dir / "time_log_f1.csv"
-    result_path = run_dir / "result_f1_mlp.json"
+    mech_path = run_dir / "mechanism.csv"
+    train_log_path = run_dir / "train_log.csv"
+    time_log_path = run_dir / "time_log.csv"
+    result_path = run_dir / "result.json"
 
     with open(mech_path, "w") as f:
         f.write("iter,epoch,eta_t,L_theta,phi_t\n")
     with open(train_log_path, "w") as f:
-        f.write("epoch,elapsed_sec,train_loss,val_loss,test_loss,val_acc,test_acc\n")
+        f.write("epoch,train_loss,train_acc,test_loss,test_acc\n")
     with open(time_log_path, "w") as f:
-        f.write("epoch,epoch_time_sec,total_elapsed_sec\n")
+        f.write("elapsed_sec,train_loss,train_acc,test_loss,test_acc\n")
 
     global_step = 0
     start_time = time.time()
@@ -446,6 +446,8 @@ def main():
         curve_logger.on_epoch_begin(epoch)
         train_loss_sum = 0.0
         train_batches = 0
+        train_correct = 0
+        train_total = 0
 
         net.train()
         learner.train()
@@ -456,6 +458,9 @@ def main():
 
             # --- 1) Train batch: compute g_t ---
             logits_tr = net(xb)
+            preds = logits_tr.argmax(dim=1)
+            train_correct += (preds == yb).sum().item()
+            train_total += yb.size(0)
             train_loss = ce(logits_tr, yb)
             train_loss_sum += float(train_loss.item())
             train_batches += 1
@@ -570,6 +575,7 @@ def main():
 
         # --- Epoch end evaluation (train loss, val/test loss + acc) ---
         train_loss_epoch = train_loss_sum / max(train_batches, 1)
+        train_acc_epoch = train_correct / max(train_total, 1)
 
         def eval_model(data_loader):
             net.eval()
@@ -599,15 +605,16 @@ def main():
 
         with open(train_log_path, "a") as f:
             f.write(
-                f"{epoch},{total_elapsed:.3f},"
-                f"{train_loss_epoch:.8f},"
-                f"{val_loss_epoch:.8f},"
-                f"{test_loss_epoch:.8f},"
-                f"{val_acc:.6f},"
-                f"{test_acc:.6f}\n"
+                f"{epoch},"
+                f"{train_loss_epoch:.8f},{train_acc_epoch:.6f},"
+                f"{test_loss_epoch:.8f},{test_acc:.6f}\n"
             )
         with open(time_log_path, "a") as f:
-            f.write(f"{epoch},{epoch_elapsed:.3f},{total_elapsed:.3f}\n")
+            f.write(
+                f"{total_elapsed:.3f},"
+                f"{train_loss_epoch:.8f},{train_acc_epoch:.6f},"
+                f"{test_loss_epoch:.8f},{test_acc:.6f}\n"
+            )
 
         print(
             f"[MNIST1D-MLP-F1-PT EPOCH {epoch}] "
@@ -623,6 +630,7 @@ def main():
                 {
                     "epoch": epoch,
                     "train_loss": train_loss_epoch,
+                    "train_acc": train_acc_epoch,
                     "val_loss": val_loss_epoch,
                     "test_loss": test_loss_epoch,
                     "val_acc": val_acc,
@@ -657,8 +665,8 @@ def main():
         "bs": int(args.bs),
         "seed": int(args.seed),
         "data_seed": int(args.data_seed),
-        "test_acc": float(final_test_acc),
-        "test_loss": float(final_test_loss),
+        "final_test_acc": float(final_test_acc),
+        "final_test_loss": float(final_test_loss),
         "elapsed_sec": float(total_time),
         "run_dir": str(run_dir),
         "preprocess": str(Path(args.preprocess_dir) / f"seed_{args.data_seed}"),

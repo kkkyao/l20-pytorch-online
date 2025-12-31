@@ -81,35 +81,36 @@ class MLPBaseline(nn.Module):
 
 # ---------------------- Loggers ----------------------
 class TimeLogger:
+    """
+    STRICT time_log.csv
+    Schema (hard contract):
+      elapsed_sec,train_loss,train_acc,test_loss,test_acc
+    """
     def __init__(self, out_csv: Path):
         self.out_csv = out_csv
         self.start_time = None
+
+        with open(self.out_csv, "w") as f:
+            f.write("elapsed_sec,train_loss,train_acc,test_loss,test_acc\n")
 
     def start(self):
         self.start_time = time.time()
 
     def log_epoch(
         self,
-        epoch,
-        train_loss, val_loss, test_loss,
-        train_acc, val_acc, test_acc,
+        train_loss, train_acc,
+        test_loss, test_acc,
     ):
         elapsed = time.time() - self.start_time
         rec = {
-            "epoch": epoch,
             "elapsed_sec": elapsed,
             "train_loss": train_loss,
-            "val_loss": val_loss,
-            "test_loss": test_loss,
             "train_acc": train_acc,
-            "val_acc": val_acc,
+            "test_loss": test_loss,
             "test_acc": test_acc,
         }
-        write_header = not self.out_csv.exists()
         with open(self.out_csv, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=rec.keys())
-            if write_header:
-                writer.writeheader()
             writer.writerow(rec)
 
 
@@ -136,36 +137,6 @@ class BatchLossLogger:
 
     def close(self):
         self._flush()
-
-
-class TrainCSVLogger:
-    def __init__(self, csv_path: Path):
-        self.csv_path = csv_path
-        self.initialized = False
-
-    def log(
-        self,
-        epoch,
-        train_loss, train_acc,
-        val_loss, val_acc,
-        test_loss, test_acc,
-    ):
-        rec = {
-            "epoch": epoch,
-            "loss": train_loss,
-            "accuracy": train_acc,
-            "val_loss": val_loss,
-            "val_accuracy": val_acc,
-            "test_loss": test_loss,
-            "test_accuracy": test_acc,
-        }
-        write_header = not self.initialized
-        with open(self.csv_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=rec.keys())
-            if write_header:
-                writer.writeheader()
-            writer.writerow(rec)
-        self.initialized = True
 
 
 # ---------------------- Train / Eval ----------------------
@@ -267,9 +238,9 @@ def main():
         train_ds, val_ds, cfg,
         seed=args.seed,
         train_shuffle=True,
-        val_shuffle=False,
+        val_shuffle=True,
         train_drop_last=True,
-        val_drop_last=False,
+        val_drop_last=True,
     )
     test_loader = make_eval_loader(
         test_ds,
@@ -309,9 +280,13 @@ def main():
 
     time_logger = TimeLogger(run_dir / "time_log.csv")
     batch_logger = BatchLossLogger(run_dir / "curve.csv")
-    train_logger = TrainCSVLogger(run_dir / "train_log.csv")
 
-    # ---------------- wandb (关键修复在这里) ----------------
+    # STRICT train_log.csv
+    train_log_path = run_dir / "train_log.csv"
+    with open(train_log_path, "w") as f:
+        f.write("epoch,train_loss,train_acc,test_loss,test_acc\n")
+
+    # ---------------- wandb ----------------
     wandb_run = None
     if args.wandb:
         import wandb
@@ -348,16 +323,16 @@ def main():
         test_loss, test_acc = evaluate(model, test_loader, criterion, device)
 
         time_logger.log_epoch(
-            epoch,
-            train_loss, val_loss, test_loss,
-            train_acc, val_acc, test_acc,
-        )
-        train_logger.log(
-            epoch,
             train_loss, train_acc,
-            val_loss, val_acc,
             test_loss, test_acc,
         )
+
+        with open(train_log_path, "a") as f:
+            f.write(
+                f"{epoch},"
+                f"{train_loss:.8f},{train_acc:.6f},"
+                f"{test_loss:.8f},{test_acc:.6f}\n"
+            )
 
         if wandb_run:
             import wandb

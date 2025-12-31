@@ -390,11 +390,11 @@ def main():
         run_dir,
         meta={"method": "learned_l_f3_cifar10_resnet18_online_pt", "seed": args.seed, "opt": "learnedL", "lr": args.theta_lr},
     )
-    mech_path = run_dir / "mechanism_f3.csv"
-    eta_stats_path = run_dir / "eta_stats_f3.csv"
-    train_log_path = run_dir / "train_log_f3.csv"
-    time_log_path = run_dir / "time_log_f3.csv"
-    result_path = run_dir / "result_f3.json"
+    mech_path = run_dir / "mechanism.csv"
+    eta_stats_path = run_dir / "eta_stats.csv"
+    train_log_path = run_dir / "train_log.csv"
+    time_log_path = run_dir / "time_log.csv"
+    result_path = run_dir / "result.json"
 
     with open(mech_path, "w") as f:
         f.write("iter,epoch,eta_t,L_theta,phi_g,phi_m,phi_diff\n")
@@ -402,9 +402,9 @@ def main():
         f.write("epoch,eta_mean,eta_std,eta_min,eta_max,eta_p50,eta_p90,eta_p99,"
                 "L_mean,phi_g_mean,phi_m_mean,phi_diff_mean,dot_mean\n")
     with open(train_log_path, "w") as f:
-        f.write("epoch,elapsed_sec,train_loss,val_loss,test_loss,val_acc,test_acc\n")
+        f.write("epoch,train_loss,train_acc,test_loss,test_acc\n")
     with open(time_log_path, "w") as f:
-        f.write("epoch,epoch_time_sec,total_elapsed_sec\n")
+        f.write("elapsed_sec,train_loss,train_acc,test_loss,test_acc\n")
 
     global_step = 0
     start_time = time.time()
@@ -417,6 +417,8 @@ def main():
 
         train_loss_sum = 0.0
         train_batches = 0
+        train_correct = 0
+        train_total = 0
 
         # epoch stats
         eta_hist, L_hist = [], []
@@ -435,6 +437,9 @@ def main():
             train_loss = ce(logits_tr, yb)
             train_loss_sum += float(train_loss.item())
             train_batches += 1
+            preds = logits_tr.argmax(dim=1)
+            train_correct += (preds == yb).sum().item()
+            train_total += yb.size(0)
 
             grads = torch.autograd.grad(train_loss, params, create_graph=False, retain_graph=False)
             grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(grads, params)]
@@ -559,6 +564,7 @@ def main():
 
         # epoch eval
         train_loss_epoch = train_loss_sum / max(train_batches, 1)
+        train_acc_epoch = train_correct / max(train_total, 1)
         val_loss_epoch, val_acc = evaluate_on_loader(net, device, val_eval_loader, ce)
         test_loss_epoch, test_acc = evaluate_on_loader(net, device, test_eval_loader, ce)
 
@@ -567,15 +573,16 @@ def main():
 
         with open(train_log_path, "a") as f:
             f.write(
-                f"{epoch},{total_elapsed:.3f},"
-                f"{train_loss_epoch:.8f},"
-                f"{val_loss_epoch:.8f},"
-                f"{test_loss_epoch:.8f},"
-                f"{val_acc:.6f},"
-                f"{test_acc:.6f}\n"
+                f"{epoch},"
+                f"{train_loss_epoch:.8f},{train_acc_epoch:.6f},"
+                f"{test_loss_epoch:.8f},{test_acc:.6f}\n"
             )
         with open(time_log_path, "a") as f:
-            f.write(f"{epoch},{epoch_elapsed:.3f},{total_elapsed:.3f}\n")
+            f.write(
+                f"{total_elapsed:.3f},"
+                f"{train_loss_epoch:.8f},{train_acc_epoch:.6f},"
+                f"{test_loss_epoch:.8f},{test_acc:.6f}\n"
+            )
 
         # eta stats
         eta_arr = np.asarray(eta_hist, dtype=np.float64) if eta_hist else np.asarray([np.nan])
@@ -658,8 +665,8 @@ def main():
         "bs": int(args.bs),
         "seed": int(args.seed),
         "data_seed": int(args.data_seed),
-        "test_acc": float(final_test_acc),
-        "test_loss": float(final_test_loss),
+        "final_test_acc": float(final_test_acc),
+        "final_test_loss": float(final_test_loss),
         "elapsed_sec": float(total_time),
         "run_dir": str(run_dir),
         "preprocess": str(Path(args.preprocess_dir) / f"seed_{args.data_seed}"),
