@@ -358,16 +358,19 @@ def main():
     curve_logger = BatchLossLogger(
         run_dir,
         meta={"method": "l2l_lstm_online_mnist1d_mlp", "seed": args.seed, "opt": "lstm_opt", "lr": args.opt_lr},
-        filename="curve_l2l.csv",
+        filename="curve.csv",
     )
-    mech_path = run_dir / "mechanism_l2l.csv"
-    train_log_path = run_dir / "train_log_l2l.csv"
-    result_path = run_dir / "result_l2l.json"
+    mech_path = run_dir / "mechanism.csv"
+    train_log_path = run_dir / "train_log.csv"
+    time_log_path = run_dir / "time_log.csv"
+    result_path = run_dir / "result.json"
 
     with open(mech_path, "w") as f:
         f.write("iter,epoch,train_loss,val_dot,meta_loss,update_norm,grad_norm\n")
     with open(train_log_path, "w") as f:
-        f.write("epoch,elapsed_sec,train_loss,val_loss,test_loss,val_acc,test_acc\n")
+        f.write("epoch,train_loss,train_acc,test_loss,test_acc\n")
+    with open(time_log_path, "w") as f:
+        f.write("elapsed_sec,train_loss,train_acc,test_loss,test_acc\n")
 
     global_step = 0
     start_time = time.time()
@@ -382,6 +385,8 @@ def main():
 
         train_loss_sum = 0.0
         train_batches = 0
+        train_correct = 0
+        train_total = 0
 
         for xb, yb in train_loader:
             xb = xb.to(device)
@@ -389,6 +394,9 @@ def main():
 
             # ---- train loss & grad (no 2nd derivatives) ----
             logits = net(xb)
+            pred = logits.argmax(dim=1)
+            train_correct += (pred == yb).sum().item()
+            train_total += yb.size(0)
             train_loss = ce(logits, yb)
             train_loss_sum += float(train_loss.item())
             train_batches += 1
@@ -467,6 +475,7 @@ def main():
 
         # ---- epoch eval ----
         train_loss_epoch = train_loss_sum / max(train_batches, 1)
+        train_acc_epoch = train_correct / max(train_total, 1)
         val_loss_epoch, val_acc = eval_model(net, val_eval_loader, device, ce)
         test_loss_epoch, test_acc = eval_model(net, test_eval_loader, device, ce)
 
@@ -475,13 +484,17 @@ def main():
 
         with open(train_log_path, "a") as f:
             f.write(
-                f"{epoch},{total_elapsed:.3f},"
-                f"{train_loss_epoch:.8f},"
-                f"{val_loss_epoch:.8f},"
-                f"{test_loss_epoch:.8f},"
-                f"{val_acc:.6f},"
-                f"{test_acc:.6f}\n"
+                f"{epoch},"
+                f"{train_loss_epoch:.8f},{train_acc_epoch:.6f},"
+                f"{test_loss_epoch:.8f},{test_acc:.6f}\n"
             )
+        with open(time_log_path, "a") as f:
+            f.write(
+                f"{total_elapsed:.3f},"
+                f"{train_loss_epoch:.8f},{train_acc_epoch:.6f},"
+                f"{test_loss_epoch:.8f},{test_acc:.6f}\n"
+            )
+
 
         print(
             f"[MNIST1D-MLP-L2L-ONLINE EPOCH {epoch}] "
@@ -527,8 +540,8 @@ def main():
         "bs": int(args.bs),
         "seed": int(args.seed),
         "data_seed": int(args.data_seed),
-        "test_acc": float(final_test_acc),
-        "test_loss": float(final_test_loss),
+        "final_test_acc": float(final_test_acc),
+        "final_test_loss": float(final_test_loss),
         "elapsed_sec": float(total_time),
         "run_dir": str(run_dir),
     }
