@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+MNIST-1D: Online learned optimizer baseline (coordinate-wise 2-layer LSTM),
+with a Conv1D backbone (instead of MLP).
+
+Key properties:
+  - Optimizee (classifier): configurable Conv1D feature extractor + linear head
+  - Optimizer (learned): coordinate-wise 2-layer LSTMCell, Appendix-A gradient preprocessing (optional)
+  - Online, first-order meta-learning objective:
+        minimize dot = <grad_val(stop), Δw(phi)>
+    to encourage a val loss decrease after applying Δw.
+
+Requested changes:
+  - Conv1D backbone (no MLP)
+  - Lower default --opt_hidden_sz
+  - Fewer/smaller conv channels & fewer layers, all as CLI args
+  - out_mul and opt_lr as CLI args (safer defaults; not too aggressive)
+  - Final report/logs: include VAL in addition to TRAIN/TEST
+
+Notes:
+  - This script uses "online / no BPTT": hidden/cell state is detached each step.
+  - This is NOT the same as the original paper’s truncated-BPTT unroll training;
+    it is your online first-order (BF/F1-style) meta objective with an LSTM optimizer.
+"""
+
+import argparse
+import json
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from data_mnist1d import load_mnist1d
+
+try:
+    import wandb  # type: ignore
+except ImportError:
+    wandb = None
+
+
+# ------------------------------- Utilities -------------------------------
+
+class BatchLossLogger:
+    def __init__(self, run_dir: Path, meta: dict, filename: str, flush_every: int = 200):
+        self.run_dir = Path(run_dir)
+        self.meta = meta
+        self.flush_every = flush_every
+        self.global_iter = 0
+        self.curr_epoch = 0
+        self.rows = []
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.curve_path = self.run_dir / filename
+        with open(self.curve_path, "w") as f:
+            f.write("iter,epoch,loss,method,seed,opt,lr\n")
+
+    def on_epoch_begin(self, epoch: int):
+        self.curr_epoch = int(epoch)
+
+    def on_train_batch_end(self, loss_value: float):
+        row = [
+            self.global_iter,
+            self.curr_epoch,
+            float(loss_value),
+            str(self.meta.get("method", "unknown")).lower(),
+            int(self.meta.get("seed", -1)),
+            str(self.meta.get("opt", "unknown")).lower(),
+            float(self.meta.get("lr", float("nan"))),
+        ]
+        self.rows.append(row)
+        self.global_iter += 1
+        if len(self.rows) >= self.flush_every:
+            self._flush()
+
+    def on_train_end(self):
+        if self.rows:
+            self._flush()
+
+    def _flush(self):
+        with open(self.curve_path, "a") as f:
+            for r in self.rows:
+                f.write(",".join(map(str, r)) + "\n")
+        self.rows.clear()
+
+
+def set_seed(s: int):
+    np.random.seed(s)
+    torch.manual_seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+
+
+def load_artifacts(preprocess_dir: Path, seed: int):
+    pdir = Path(preprocess_dir) / f"seed_{seed}"
+    split_path = pdir / "split.json"
+    norm_path = pdir / "norm.json"
+    if not split_path.exists() or not norm_path.exists():
+        raise FileNotFoundError(f"Preprocess artifacts not found under: {pdir}")
+    with open(split_path, "r", encoding="utf-8") as f:
+        split = json.load(f)
+    with open(norm_path, "r", encoding="utf-8") as f:
+        norm = json.load(f)
+    return split, norm
+
+
+def apply_norm_np(x: np.ndarray, mean: np.ndarray, std: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    return (x - mean[None, :]) / (std[None, :] + eps)
+
+
+def to_NL(x: np.ndarray, length: int) -> np.ndarray:
+    x = np.asarray(x)
+    if x.ndim == 2 and x.shape[1] == length:
+        return x
+    if x.ndim == 3:
+        if x.shape[1] == length and x.shape[2] == 1:
+            return x[:, :, 0]
+        if x.shape[1] == 1 and x.shape[2] == length:
+            return x[:, 0, :]
+    raise AssertionError(f"Unexpected x shape: {x.shape}")
+
+
+def parse_int_list(s: str) -> List[int]:
+    # Accept "8,16" or "8,16,32" or "8 16" styles
+    s = s.strip().replace(" ", ",")
+    parts = [p for p in s.split(",") if p != ""]
+    if not parts:
+        raise ValueError("Empty list for --conv_channels.")
+    return [int(p) for p in parts]
+
+
+# --------------------------- Conv1D backbone ---------------------------
+
+def build_conv1d(
+    input_len: int = 40,
+    channels: Tuple[int, ...] = (8, 16),
+    kernel_size: int = 5,
+    pool: int = 2,
+    dropout: float = 0.0,
+    use_adaptive_pool: bool = True,
+) -> nn.Module:
+    """
+    Simple Conv1D feature extractor:
+    - Block: Conv1d -> ReLU -> (optional Dropout) -> MaxPool1d
+    - Then either AdaptiveAvgPool1d(1) or flatten full length (if adaptive disabled)
+    - Linear head to 10 classes
+
+    Input shape expected: [B, 1, L]
+    """
+
+    class Conv1DBackbone(nn.Module):
+        def __init__(self, length: int):
+            super().__init__()
+            layers = []
+            in_ch = 1
+            for out_ch in channels:
+                layers.append(nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding=kernel_size // 2))
+                layers.append(nn.ReLU(inplace=True))
+                if dropout and dropout > 0:
+                    layers.append(nn.Dropout(p=float(dropout)))
+                if pool and pool > 1:
+                    layers.append(nn.MaxPool1d(kernel_size=int(pool)))
+                in_ch = out_ch
+
+            self.feat = nn.Sequential(*layers)
+            self.use_adaptive_pool = bool(use_adaptive_pool)
+
+            if self.use_adaptive_pool:
+                self.pool = nn.AdaptiveAvgPool1d(1)
+                head_in = in_ch
+            else:
+                # Compute resulting length after pooling for a fixed head size
+                down = int(pool) ** len(channels) if (pool and pool > 1) else 1
+                feat_len = max(1, length // down)
+                self.pool = None
+                head_in = in_ch * feat_len
+
+            self.head = nn.Linear(head_in, 10)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # x: [B, 1, L]
+            x = self.feat(x)
+            if self.use_adaptive_pool:
+                x = self.pool(x)  # [B, C, 1]
+                x = x.squeeze(-1)  # [B, C]
+            else:
+                x = x.flatten(1)   # [B, C*L']
+            return self.head(x)
+
+    return Conv1DBackbone(input_len)
+
+
+# ---------------------- Learned Optimizer (coordinate-wise LSTM) ----------------------
+
+class LearnedOptimizer(nn.Module):
+    def __init__(self, hidden_sz: int = 10, preproc: bool = True, preproc_factor: float = 10.0):
+        super().__init__()
+        self.hidden_sz = int(hidden_sz)
+        self.preproc = bool(preproc)
+        self.preproc_factor = float(preproc_factor)
+        self.preproc_threshold = float(np.exp(-self.preproc_factor))
+
+        in_dim = 2 if self.preproc else 1
+        self.lstm1 = nn.LSTMCell(in_dim, self.hidden_sz)
+        self.lstm2 = nn.LSTMCell(self.hidden_sz, self.hidden_sz)
+        self.out = nn.Linear(self.hidden_sz, 1)
+
+    def _preprocess(self, g: torch.Tensor) -> torch.Tensor:
+        # g: [N,1]
+        gd = g.detach()
+        out = torch.zeros(gd.size(0), 2, device=gd.device, dtype=gd.dtype)
+        keep = (gd.abs() >= self.preproc_threshold).view(-1)
+
+        out[keep, 0] = (torch.log(gd[keep].abs() + 1e-8) / self.preproc_factor).view(-1)
+        out[keep, 1] = torch.sign(gd[keep]).view(-1)
+
+        out[~keep, 0] = -1.0
+        out[~keep, 1] = (float(np.exp(self.preproc_factor)) * gd[~keep]).view(-1)
+        return out
+
+    def forward(self, grad_vec: torch.Tensor, hidden, cell):
+        if self.preproc:
+            x = self._preprocess(grad_vec)  # [N,2]
+        else:
+            x = grad_vec.detach()  # [N,1]
+
+        h0, c0 = self.lstm1(x, (hidden[0], cell[0]))
+        h1, c1 = self.lstm2(h0, (hidden[1], cell[1]))
+        update = self.out(h1)  # [N,1]
+        return update, (h0, h1), (c0, c1)
+
+
+def flatten_like_params(tensors, params):
+    vecs = []
+    for t, p in zip(tensors, params):
+        if t is None:
+            vecs.append(torch.zeros(p.numel(), device=p.device, dtype=p.dtype))
+        else:
+            vecs.append(t.reshape(-1))
+    return torch.cat(vecs, dim=0).view(-1, 1)  # [N,1]
+
+
+def unflatten_to_params(vec: torch.Tensor, params):
+    outs = []
+    offset = 0
+    v = vec.view(-1)
+    for p in params:
+        sz = p.numel()
+        outs.append(v[offset:offset + sz].view_as(p))
+        offset += sz
+    return outs
+
+
+@torch.no_grad()
+def eval_model(net: nn.Module, data_loader, device, ce):
+    net.eval()
+    losses = []
+    correct = 0
+    total = 0
+    for xb, yb in data_loader:
+        xb = xb.to(device).unsqueeze(1)  # Conv1D expects [B,1,L]
+        yb = yb.to(device)
+        logits = net(xb)
+        loss = ce(logits, yb)
+        losses.append(float(loss.item()))
+        pred = logits.argmax(dim=1)
+        correct += int((pred == yb).sum().item())
+        total += int(yb.size(0))
+    return (float(np.mean(losses)) if losses else float("nan"), correct / max(total, 1))
+
+
+# ------------------------------ Main ------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+
+    # data
+    ap.add_argument("--length", type=int, default=40)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--data_seed", type=int, default=42)
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--bs", type=int, default=128)
+    ap.add_argument("--preprocess_dir", type=str, default="artifacts/preprocess")
+
+    # conv1d backbone (requested as CLI)
+    ap.add_argument("--conv_channels", type=str, default="8,16", help='e.g. "8,16" for 2 layers; "8,16,32" for 3.')
+    ap.add_argument("--conv_kernel", type=int, default=5)
+    ap.add_argument("--conv_pool", type=int, default=2)
+    ap.add_argument("--conv_dropout", type=float, default=0.0)
+    ap.add_argument("--no_adaptive_pool", action="store_true", help="If set, flatten full conv output instead of adaptive pool.")
+
+    # learned optimizer (requested as CLI)
+    ap.add_argument("--opt_hidden_sz", type=int, default=10)   # lowered default
+    ap.add_argument("--opt_lr", type=float, default=1e-3)
+    ap.add_argument("--out_mul", type=float, default=3e-3)     # slightly larger but not aggressive
+    ap.add_argument("--no_preproc", action="store_true")
+    ap.add_argument("--preproc_factor", type=float, default=10.0)
+
+    # stability knobs
+    ap.add_argument("--clip_update", type=float, default=0.1)     # Δw clip
+    ap.add_argument("--reg_update", type=float, default=1e-6)     # update L2 reg
+    ap.add_argument("--clip_phi_grad", type=float, default=1.0)   # phi grad clip
+
+    # wandb
+    ap.add_argument("--wandb", action="store_true")
+    ap.add_argument("--wandb_project", type=str, default="l2o-mnist1d")
+    ap.add_argument("--wandb_group", type=str, default="mnist1d_conv1d_l2l_online")
+    ap.add_argument("--wandb_run_name", type=str, default=None)
+
+    args = ap.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] device = {device}")
+    set_seed(args.seed)
+
+    conv_channels = tuple(parse_int_list(args.conv_channels))
+    use_adaptive_pool = (not args.no_adaptive_pool)
+
+    run_name = (
+        f"mnist1d_conv1d_l2l_online_data{args.data_seed}_seed{args.seed}_"
+        f"C{'-'.join(map(str, conv_channels))}_k{args.conv_kernel}_p{args.conv_pool}_"
+        f"hs{args.opt_hidden_sz}_lr{args.opt_lr}_out{args.out_mul}_"
+        + datetime.now().strftime("%Y%m%d-%H%M%S")
+    )
+    run_dir = Path("runs") / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] run_dir = {run_dir}")
+
+    wandb_run = None
+    if args.wandb:
+        if wandb is None:
+            raise RuntimeError("wandb is not installed, but --wandb was passed.")
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            group=args.wandb_group,
+            name=args.wandb_run_name or run_name,
+            config={**vars(args), "conv_channels_parsed": list(conv_channels)},
+        )
+
+    # ---------------- data ----------------
+    (xtr, ytr), (xte, yte) = load_mnist1d(length=args.length, seed=args.data_seed)
+
+    xtr = to_NL(xtr, length=args.length).astype(np.float32, copy=False)
+    xte = to_NL(xte, length=args.length).astype(np.float32, copy=False)
+    ytr = np.asarray(ytr, dtype=np.int64)
+    yte = np.asarray(yte, dtype=np.int64)
+
+    split, norm = load_artifacts(Path(args.preprocess_dir), seed=args.data_seed)
+    mean = np.array(norm["mean"], np.float32)
+    std = np.array(norm["std"], np.float32)
+    train_idx = np.array(split["train_idx"], dtype=np.int64)
+    val_idx = np.array(split["val_idx"], dtype=np.int64)
+
+    x_train = apply_norm_np(xtr[train_idx], mean, std)
+    y_train = ytr[train_idx]
+    x_val = apply_norm_np(xtr[val_idx], mean, std)
+    y_val = ytr[val_idx]
+    x_test = apply_norm_np(xte, mean, std)
+    y_test = yte
+
+    x_train_t = torch.from_numpy(x_train)
+    y_train_t = torch.from_numpy(y_train)
+    x_val_t = torch.from_numpy(x_val)
+    y_val_t = torch.from_numpy(y_val)
+    x_test_t = torch.from_numpy(x_test)
+    y_test_t = torch.from_numpy(y_test)
+
+    # Reproducible shuffling
+    gen = torch.Generator()
+    gen.manual_seed(int(args.seed))
+
+    train_loader = DataLoader(
+        TensorDataset(x_train_t, y_train_t),
+        batch_size=args.bs,
+        shuffle=True,
+        drop_last=True,
+        generator=gen,
+    )
+    val_loader = DataLoader(
+        TensorDataset(x_val_t, y_val_t),
+        batch_size=args.bs,
+        shuffle=True,
+        drop_last=True,
+        generator=gen,
+    )
+
+    def infinite_loader(loader):
+        while True:
+            for b in loader:
+                yield b
+
+    val_iter = infinite_loader(val_loader)
+
+    val_eval_loader = DataLoader(TensorDataset(x_val_t, y_val_t), batch_size=512, shuffle=False)
+    test_eval_loader = DataLoader(TensorDataset(x_test_t, y_test_t), batch_size=512, shuffle=False)
+    train_eval_loader = DataLoader(TensorDataset(x_train_t, y_train_t), batch_size=512, shuffle=False)
+
+    # ---------------- models ----------------
+    net = build_conv1d(
+        input_len=args.length,
+        channels=conv_channels,
+        kernel_size=args.conv_kernel,
+        pool=args.conv_pool,
+        dropout=args.conv_dropout,
+        use_adaptive_pool=use_adaptive_pool,
+    ).to(device)
+
+    opt_net = LearnedOptimizer(
+        hidden_sz=args.opt_hidden_sz,
+        preproc=(not args.no_preproc),
+        preproc_factor=args.preproc_factor,
+    ).to(device)
+
+    meta_opt = torch.optim.Adam(opt_net.parameters(), lr=args.opt_lr)
+    ce = nn.CrossEntropyLoss()
+
+    params = list(net.parameters())
+    n_params = int(sum(p.numel() for p in params))
+    hidden = [torch.zeros(n_params, args.opt_hidden_sz, device=device) for _ in range(2)]
+    cell = [torch.zeros(n_params, args.opt_hidden_sz, device=device) for _ in range(2)]
+
+    # ---------------- logs ----------------
+    curve_logger = BatchLossLogger(
+        run_dir,
+        meta={"method": "l2l_lstm_online_mnist1d_conv1d", "seed": args.seed, "opt": "lstm_opt", "lr": args.opt_lr},
+        filename="curve.csv",
+    )
+    mech_path = run_dir / "mechanism.csv"
+    train_log_path = run_dir / "train_log.csv"
+    time_log_path = run_dir / "time_log.csv"
+    result_path = run_dir / "result.json"
+
+    with open(mech_path, "w") as f:
+        f.write("iter,epoch,train_loss,val_dot,meta_loss,update_norm,grad_norm\n")
+
+    # Requested: include VAL in the report/logs
+    with open(train_log_path, "w") as f:
+        f.write("epoch,train_loss,train_acc,val_loss,val_acc,test_loss,test_acc\n")
+
+    with open(time_log_path, "w") as f:
+        f.write("elapsed_sec,train_loss,train_acc,val_loss,val_acc,test_loss,test_acc\n")
+
+    global_step = 0
+    start_time = time.time()
+
+    # ---------------- training loop ----------------
+    for epoch in range(args.epochs):
+        epoch_start = time.time()
+        curve_logger.on_epoch_begin(epoch)
+
+        net.train()
+        opt_net.train()
+
+        train_loss_sum = 0.0
+        train_batches = 0
+        train_correct = 0
+        train_total = 0
+
+        for xb, yb in train_loader:
+            xb = xb.to(device).unsqueeze(1)  # Conv1D expects [B,1,L]
+            yb = yb.to(device)
+
+            # ---- train loss & grad (no 2nd derivatives) ----
+            logits = net(xb)
+            pred = logits.argmax(dim=1)
+            train_correct += (pred == yb).sum().item()
+            train_total += yb.size(0)
+            train_loss = ce(logits, yb)
+            train_loss_sum += float(train_loss.item())
+            train_batches += 1
+
+            grads = torch.autograd.grad(train_loss, params, create_graph=False, retain_graph=False, allow_unused=False)
+            g_vec = flatten_like_params(grads, params)  # [N,1]
+
+            # ---- proposal Δw from current phi ----
+            update_vec_1, _, _ = opt_net(g_vec, hidden, cell)  # depends on phi
+            delta_list_1 = unflatten_to_params(update_vec_1 * args.out_mul, params)
+
+            # ---- val grad (stop-grad) ----
+            xv, yv = next(val_iter)
+            xv = xv.to(device).unsqueeze(1)
+            yv = yv.to(device)
+            val_logits = net(xv)
+            val_loss = ce(val_logits, yv)
+            grad_val = torch.autograd.grad(val_loss, params, create_graph=False, retain_graph=False, allow_unused=False)
+
+            # dot = <grad_val(stop), Δw(phi)>
+            dot = torch.zeros([], device=device, dtype=update_vec_1.dtype)
+            for gv, dw in zip(grad_val, delta_list_1):
+                dot = dot + (gv.detach() * dw).sum()
+
+            # Minimize dot to reduce val_loss after applying Δw:
+            #   L_val(w+Δw) ≈ L_val(w) + dot
+            meta_loss = dot
+            if args.reg_update is not None and float(args.reg_update) > 0.0:
+                meta_loss = meta_loss + float(args.reg_update) * torch.mean(update_vec_1.pow(2))
+
+            meta_opt.zero_grad(set_to_none=True)
+            meta_loss.backward()
+
+            # clip optimizer-parameter grads (phi)
+            if args.clip_phi_grad is not None and float(args.clip_phi_grad) > 0.0:
+                torch.nn.utils.clip_grad_norm_(opt_net.parameters(), max_norm=float(args.clip_phi_grad))
+
+            meta_opt.step()
+
+            # ---- apply update using UPDATED phi (no grad) ----
+            with torch.no_grad():
+                update_vec_2, h_new_2, c_new_2 = opt_net(g_vec, hidden, cell)
+                delta_vec = update_vec_2 * args.out_mul  # [N,1]
+
+                # clip Δw global norm if requested
+                if args.clip_update is not None and float(args.clip_update) > 0.0:
+                    upd_norm = torch.linalg.vector_norm(delta_vec.view(-1)).clamp_min(1e-12)
+                    coef = min(1.0, float(args.clip_update) / float(upd_norm.item()))
+                    delta_vec.mul_(coef)
+
+                upd_norm = torch.linalg.vector_norm(delta_vec.view(-1)).clamp_min(1e-12)
+
+                # apply to params
+                delta_list = unflatten_to_params(delta_vec, params)
+                for p, dw in zip(params, delta_list):
+                    p.add_(dw)
+
+                # carry state (detach each step, online / no BPTT)
+                hidden = [h.detach() for h in h_new_2]
+                cell = [c.detach() for c in c_new_2]
+
+                g_norm = torch.linalg.vector_norm(g_vec.view(-1)).clamp_min(1e-12)
+
+                with open(mech_path, "a") as f:
+                    f.write(
+                        f"{global_step},{epoch},"
+                        f"{float(train_loss.item()):.8f},"
+                        f"{float(dot.item()):.8f},"
+                        f"{float(meta_loss.item()):.8f},"
+                        f"{float(upd_norm.item()):.6g},"
+                        f"{float(g_norm.item()):.6g}\n"
+                    )
+
+            curve_logger.on_train_batch_end(float(train_loss.item()))
+            global_step += 1
+
+        # ---- epoch eval (TRAIN/VAL/TEST) ----
+        train_loss_epoch = train_loss_sum / max(train_batches, 1)
+        train_acc_epoch = train_correct / max(train_total, 1)
+
+        # For reporting, also compute full-set metrics (consistent logging)
+        val_loss_epoch, val_acc_epoch = eval_model(net, val_eval_loader, device, ce)
+        test_loss_epoch, test_acc_epoch = eval_model(net, test_eval_loader, device, ce)
+
+        total_elapsed = time.time() - start_time
+        epoch_elapsed = time.time() - epoch_start
+
+        with open(train_log_path, "a") as f:
+            f.write(
+                f"{epoch},"
+                f"{train_loss_epoch:.8f},{train_acc_epoch:.6f},"
+                f"{val_loss_epoch:.8f},{val_acc_epoch:.6f},"
+                f"{test_loss_epoch:.8f},{test_acc_epoch:.6f}\n"
+            )
+
+        with open(time_log_path, "a") as f:
+            f.write(
+                f"{total_elapsed:.3f},"
+                f"{train_loss_epoch:.8f},{train_acc_epoch:.6f},"
+                f"{val_loss_epoch:.8f},{val_acc_epoch:.6f},"
+                f"{test_loss_epoch:.8f},{test_acc_epoch:.6f}\n"
+            )
+
+        print(
+            f"[MNIST1D-CONV1D-L2L-ONLINE EPOCH {epoch}] "
+            f"time={epoch_elapsed:.2f}s total={total_elapsed/60:.2f}min "
+            f"train={train_loss_epoch:.4f} val={val_loss_epoch:.4f} test={test_loss_epoch:.4f} "
+            f"val_acc={val_acc_epoch:.4f} test_acc={test_acc_epoch:.4f}"
+        )
+
+        if wandb_run is not None:
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss_epoch,
+                    "val_loss": val_loss_epoch,
+                    "test_loss": test_loss_epoch,
+                    "train_acc": train_acc_epoch,
+                    "val_acc": val_acc_epoch,
+                    "test_acc": test_acc_epoch,
+                    "time/epoch_sec": epoch_elapsed,
+                    "time/total_sec": total_elapsed,
+                }
+            )
+
+    curve_logger.on_train_end()
+    total_time = time.time() - start_time
+
+    # ---------------- final report (include VAL) ----------------
+    final_train_loss, final_train_acc = eval_model(net, train_eval_loader, device, ce)
+    final_val_loss, final_val_acc = eval_model(net, val_eval_loader, device, ce)
+    final_test_loss, final_test_acc = eval_model(net, test_eval_loader, device, ce)
+
+    print(
+        f"[RESULT-MNIST1D-CONV1D-L2L-ONLINE] "
+        f"TrainAcc={final_train_acc:.4f} ValAcc={final_val_acc:.4f} TestAcc={final_test_acc:.4f} "
+        f"(TrainLoss={final_train_loss:.4f} ValLoss={final_val_loss:.4f} TestLoss={final_test_loss:.4f}) "
+        f"(Total time={total_time/60:.2f} min)"
+    )
+
+    result = {
+        "dataset": f"MNIST-1D(len={args.length})",
+        "backbone": "Conv1D",
+        "conv_channels": list(conv_channels),
+        "conv_kernel": int(args.conv_kernel),
+        "conv_pool": int(args.conv_pool),
+        "conv_dropout": float(args.conv_dropout),
+        "adaptive_pool": bool(use_adaptive_pool),
+        "method": "l2l_coordinatewise_lstm_online_firstorder",
+        "epochs": int(args.epochs),
+        "bs": int(args.bs),
+        "seed": int(args.seed),
+        "data_seed": int(args.data_seed),
+        "opt_hidden_sz": int(args.opt_hidden_sz),
+        "opt_lr": float(args.opt_lr),
+        "out_mul": float(args.out_mul),
+        "final_train_acc": float(final_train_acc),
+        "final_train_loss": float(final_train_loss),
+        "final_val_acc": float(final_val_acc),
+        "final_val_loss": float(final_val_loss),
+        "final_test_acc": float(final_test_acc),
+        "final_test_loss": float(final_test_loss),
+        "elapsed_sec": float(total_time),
+        "run_dir": str(run_dir),
+    }
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+
+    if wandb_run is not None:
+        wandb_run.summary["final_train_acc"] = float(final_train_acc)
+        wandb_run.summary["final_train_loss"] = float(final_train_loss)
+        wandb_run.summary["final_val_acc"] = float(final_val_acc)
+        wandb_run.summary["final_val_loss"] = float(final_val_loss)
+        wandb_run.summary["final_test_acc"] = float(final_test_acc)
+        wandb_run.summary["final_test_loss"] = float(final_test_loss)
+        wandb_run.summary["total_time_sec"] = float(total_time)
+
+        for p in [curve_logger.curve_path, mech_path, train_log_path, time_log_path, result_path]:
+            if Path(p).exists():
+                wandb.save(str(p))
+
+        wandb_run.finish()
+
+
+if __name__ == "__main__":
+    main()
