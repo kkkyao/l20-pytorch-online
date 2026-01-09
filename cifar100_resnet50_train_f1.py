@@ -666,12 +666,11 @@ def main():
     total_time = time.time() - start_time
 
     # final eval
-    net.eval()
-    with torch.no_grad():
-        logits_test = net(x_test_t.to(device))
-        final_test_loss = ce(logits_test, y_test_t.to(device)).item()
-        preds_test = logits_test.argmax(dim=1)
-        final_test_acc = (preds_test == y_test_t.to(device)).float().mean().item()
+    # ---------------- final eval (SAFE: batched) ----------------
+    if device.type == "cuda":
+        torch.cuda.empty_cache()   
+    final_test_loss, final_test_acc = evaluate_on_loader(net, device, test_eval_loader, ce)
+
 
     print(
         f"[RESULT-CIFAR100-ResNet50-F1-PT] "
