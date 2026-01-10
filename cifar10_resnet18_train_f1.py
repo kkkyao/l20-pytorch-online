@@ -604,11 +604,11 @@ def main():
             )
 
         print(
-            f"[CIFAR10-ResNet18-F1-PT EPOCH {epoch}] "
+            f"[CIFAR100-ResNet50-F1-PT EPOCH {epoch}] "
             f"time={epoch_elapsed:.2f}s total={total_elapsed/60:.2f}min "
-            f"train={train_loss_epoch:.4f} "
-            f"val={val_loss_epoch:.4f} test={test_loss_epoch:.4f} "
-            f"val_acc={val_acc:.4f} test_acc={test_acc:.4f} "
+            f"train_loss={train_loss_epoch:.4f} train_acc={train_acc_epoch:.4f} "
+            f"val_loss={val_loss_epoch:.4f} val_acc={val_acc:.4f} "
+            f"test_loss={test_loss_epoch:.4f} test_acc={test_acc:.4f} "
             f"eta_mean={eta_mean:.3g} eta_p99={eta_p99:.3g}"
         )
 
@@ -619,6 +619,7 @@ def main():
                     "train_loss": train_loss_epoch,
                     "val_loss": val_loss_epoch,
                     "test_loss": test_loss_epoch,
+                    "train_acc": train_acc_epoch,
                     "val_acc": val_acc,
                     "test_acc": test_acc,
                     "time/epoch_sec": epoch_elapsed,
